@@ -29,7 +29,7 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
     await waitForHealth(daemonPort);
     const health = await fetch(`http://127.0.0.1:${daemonPort}/health`);
     expect(health.headers.get(PROTOCOL_HEADER)).toBe(String(PROTOCOL_VERSION));
-    expect((await health.json()).protocol).toBe(PROTOCOL_VERSION);
+    expect(((await health.json()) as { protocol?: unknown }).protocol).toBe(PROTOCOL_VERSION);
 
     const unauthorized = await fetch(`http://127.0.0.1:${daemonPort}/command`, {
       method: "POST",
@@ -62,14 +62,13 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
     expect(spawned.turnId).toStartWith("trn_");
     expect(spawned.label).toBe("reviewer");
 
-    const first = await cli(entry, env, directory, [
+    const firstWait = cli(entry, env, directory, [
       "wait",
       "--project",
       directory,
       spawned.turnId as string,
     ]);
-    expect(first).toMatchObject({ status: "completed", text: "reply: remember 8675309" });
-
+    await Bun.sleep(20);
     const followup = await cli(entry, env, directory, [
       "followup",
       "--project",
@@ -77,6 +76,10 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
       spawned.workerId as string,
       "what number?",
     ]);
+    expect(followup.status).toBe("queued");
+    const first = await firstWait;
+    expect(first).toMatchObject({ status: "completed", text: "reply: remember 8675309" });
+
     const second = await cli(entry, env, directory, [
       "wait",
       "--project",
@@ -112,7 +115,7 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const sessions = new Map<
     string,
-    { status: "idle" | "busy"; messages: Array<Record<string, any>> }
+    { directory: string; status: "idle" | "busy"; messages: Array<Record<string, any>> }
   >();
 
   const emit = (payload: Record<string, unknown>): void => {
@@ -150,12 +153,14 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
       }
       if (request.method === "POST" && url.pathname === "/session") {
         const id = `session-${++session}`;
-        sessions.set(id, { status: "idle", messages: [] });
-        return Response.json({ id, directory: url.searchParams.get("directory") });
+        const directory = url.searchParams.get("directory") ?? "";
+        sessions.set(id, { directory, status: "idle", messages: [] });
+        return Response.json({ id, directory });
       }
       if (request.method === "GET" && url.pathname === "/permission") return Response.json([]);
       if (request.method === "GET" && url.pathname === "/question") return Response.json([]);
       if (request.method === "GET" && url.pathname === "/session/status") {
+        if (!url.searchParams.has("directory")) return new Response("directory required", { status: 400 });
         return Response.json(
           Object.fromEntries([...sessions].map(([id, value]) => [id, { type: value.status }])),
         );
@@ -165,6 +170,9 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
         const sessionId = decodeURIComponent(promptMatch[1]!);
         const current = sessions.get(sessionId);
         if (!current) return new Response("not found", { status: 404 });
+        if (url.searchParams.get("directory") !== current.directory) {
+          return new Response("wrong directory", { status: 400 });
+        }
         const body = (await request.json()) as {
           messageID?: string;
           parts?: Array<{ type?: string; text?: string }>;
@@ -180,6 +188,7 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
         const reply = {
           info: {
             id: assistantMessageId,
+            sessionID: sessionId,
             role: "assistant",
             parentID: userMessageId,
             time: { created: Date.now() } as { created: number; completed?: number },
@@ -187,12 +196,12 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
           parts: [{ type: "text", text: `reply: ${prompt}` }],
         };
         current.messages.push(reply);
-        emit({ type: "message.updated", properties: { sessionID: sessionId, info: reply.info } });
+        emit({ type: "message.updated", properties: { info: reply.info } });
         void (async () => {
-          await Bun.sleep(10);
+          await Bun.sleep(prompt.includes("8675309") ? 1_000 : 10);
           reply.info.time.completed = Date.now();
           current.status = "idle";
-          emit({ type: "message.updated", properties: { sessionID: sessionId, info: reply.info } });
+          emit({ type: "message.updated", properties: { info: reply.info } });
           emit({ type: "session.idle", properties: { sessionID: sessionId } });
         })();
         return new Response(null, { status: 204 });
@@ -200,6 +209,9 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
       const singleMessage = url.pathname.match(/^\/session\/([^/]+)\/message\/([^/]+)$/);
       if (request.method === "GET" && singleMessage) {
         const current = sessions.get(decodeURIComponent(singleMessage[1]!));
+        if (current && url.searchParams.get("directory") !== current.directory) {
+          return new Response("wrong directory", { status: 400 });
+        }
         const message = current?.messages.find(
           (entry) => entry.info.id === decodeURIComponent(singleMessage[2]!),
         );
@@ -207,7 +219,11 @@ function fakeOpenCode(): ReturnType<typeof Bun.serve> {
       }
       const messages = url.pathname.match(/^\/session\/([^/]+)\/message$/);
       if (request.method === "GET" && messages) {
-        return Response.json(sessions.get(decodeURIComponent(messages[1]!))?.messages ?? []);
+        const current = sessions.get(decodeURIComponent(messages[1]!));
+        if (current && url.searchParams.get("directory") !== current.directory) {
+          return new Response("wrong directory", { status: 400 });
+        }
+        return Response.json(current?.messages ?? []);
       }
       if (request.method === "POST" && /\/session\/[^/]+\/abort$/.test(url.pathname)) {
         return Response.json(true);

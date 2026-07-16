@@ -2,13 +2,14 @@ export interface OpenCodePort {
   createSession(input: { directory: string; label?: string }): Promise<string>;
   runTurn(
     sessionId: string,
+    directory: string,
     messageId: string,
     input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
   ): Promise<string>;
-  recoverTurn(sessionId: string, messageId: string, signal: AbortSignal): Promise<string>;
-  abort(sessionId: string): Promise<void>;
-  close(sessionId: string): Promise<void>;
+  recoverTurn(sessionId: string, directory: string, messageId: string, signal: AbortSignal): Promise<string>;
+  abort(sessionId: string, directory: string): Promise<void>;
+  close(sessionId: string, directory: string): Promise<void>;
 }
 
 interface MessageEnvelope {
@@ -25,12 +26,15 @@ interface MessageEnvelope {
 
 interface PendingTurn {
   readonly sessionId: string;
+  readonly directory: string;
   readonly userMessageId: string;
   readonly promise: Promise<string>;
   readonly signal: AbortSignal;
   resolve(value: string): void;
   reject(error: unknown): void;
   assistantMessageId?: string;
+  observed: boolean;
+  readonly failIfIdleWithoutResult: boolean;
   finishing: boolean;
   abortListener(): void;
 }
@@ -79,6 +83,7 @@ export class OpenCodeClient {
 
   async promptAsync(
     sessionId: string,
+    directory: string,
     messageId: string,
     input: { message: string; agent?: string; model?: string },
   ): Promise<void> {
@@ -88,30 +93,33 @@ export class OpenCodeClient {
     };
     if (input.agent) body.agent = input.agent;
     if (input.model) body.model = parseModel(input.model);
-    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}/prompt_async`, this.baseUrl), {
+    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/prompt_async`, directory), {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify(body),
     });
   }
 
-  async sessionStatus(sessionId: string): Promise<"busy" | "idle" | "retry"> {
-    const response = await this.request(new URL("/session/status", this.baseUrl));
+  async sessionStatus(sessionId: string, directory: string): Promise<"busy" | "idle" | "retry"> {
+    const response = await this.request(this.directoryUrl("/session/status", directory));
     const statuses = (await response.json()) as Record<string, { type?: unknown }>;
     const status = statuses[sessionId]?.type;
     return status === "busy" || status === "retry" ? status : "idle";
   }
 
-  async getMessage(sessionId: string, messageId: string): Promise<MessageEnvelope> {
+  async getMessage(sessionId: string, directory: string, messageId: string): Promise<MessageEnvelope> {
     const response = await this.request(
-      new URL(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`, this.baseUrl),
+      this.directoryUrl(
+        `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
+        directory,
+      ),
     );
     return (await response.json()) as MessageEnvelope;
   }
 
-  async findAssistant(sessionId: string, userMessageId: string): Promise<MessageEnvelope | null> {
+  async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
     const response = await this.request(
-      new URL(`/session/${encodeURIComponent(sessionId)}/message`, this.baseUrl),
+      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
     );
     const messages = (await response.json()) as MessageEnvelope[];
     for (let index = messages.length - 1; index >= 0; index--) {
@@ -132,38 +140,38 @@ export class OpenCodeClient {
     return response;
   }
 
-  async pendingPermissions(): Promise<Array<{ id?: string; sessionID?: string }>> {
-    const response = await this.request(new URL("/permission", this.baseUrl));
+  async pendingPermissions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
+    const response = await this.request(this.directoryUrl("/permission", directory));
     return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
   }
 
-  async approvePermission(requestId: string): Promise<void> {
-    await this.request(new URL(`/permission/${encodeURIComponent(requestId)}/reply`, this.baseUrl), {
+  async approvePermission(requestId: string, directory: string): Promise<void> {
+    await this.request(this.directoryUrl(`/permission/${encodeURIComponent(requestId)}/reply`, directory), {
       method: "POST",
       headers: JSON_HEADERS,
       body: JSON.stringify({ reply: "once" }),
     });
   }
 
-  async pendingQuestions(): Promise<Array<{ id?: string; sessionID?: string }>> {
-    const response = await this.request(new URL("/question", this.baseUrl));
+  async pendingQuestions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
+    const response = await this.request(this.directoryUrl("/question", directory));
     return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
   }
 
-  async rejectQuestion(requestId: string): Promise<void> {
-    await this.request(new URL(`/question/${encodeURIComponent(requestId)}/reject`, this.baseUrl), {
+  async rejectQuestion(requestId: string, directory: string): Promise<void> {
+    await this.request(this.directoryUrl(`/question/${encodeURIComponent(requestId)}/reject`, directory), {
       method: "POST",
     });
   }
 
-  async abort(sessionId: string): Promise<void> {
-    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, this.baseUrl), {
+  async abort(sessionId: string, directory: string): Promise<void> {
+    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/abort`, directory), {
       method: "POST",
     });
   }
 
-  async close(sessionId: string): Promise<void> {
-    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}`, this.baseUrl), {
+  async close(sessionId: string, directory: string): Promise<void> {
+    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}`, directory), {
       method: "DELETE",
     });
   }
@@ -197,6 +205,12 @@ export class OpenCodeClient {
     }
     return response;
   }
+
+  private directoryUrl(path: string, directory: string): URL {
+    const url = new URL(path, this.baseUrl);
+    url.searchParams.set("directory", directory);
+    return url;
+  }
 }
 
 export class ManagedOpenCode implements OpenCodePort {
@@ -223,14 +237,15 @@ export class ManagedOpenCode implements OpenCodePort {
 
   async runTurn(
     sessionId: string,
+    directory: string,
     messageId: string,
     input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
   ): Promise<string> {
     await this.ensureRunning();
-    const pending = this.watch(sessionId, messageId, signal);
+    const pending = this.watch(sessionId, directory, messageId, signal, false);
     try {
-      await this.client.promptAsync(sessionId, messageId, input);
+      await this.client.promptAsync(sessionId, directory, messageId, input);
       await this.refresh(pending);
       return await pending.promise;
     } catch (error) {
@@ -239,25 +254,33 @@ export class ManagedOpenCode implements OpenCodePort {
     }
   }
 
-  async recoverTurn(sessionId: string, messageId: string, signal: AbortSignal): Promise<string> {
+  async recoverTurn(
+    sessionId: string,
+    directory: string,
+    messageId: string,
+    signal: AbortSignal,
+  ): Promise<string> {
     await this.ensureRunning();
-    const existing = await this.client.findAssistant(sessionId, messageId);
+    const existing = await this.client.findAssistant(sessionId, directory, messageId);
     if (existing && isComplete(existing)) return resultText(existing);
 
-    const pending = this.watch(sessionId, messageId, signal);
-    if (existing) pending.assistantMessageId = existing.info.id;
+    const pending = this.watch(sessionId, directory, messageId, signal, true);
+    if (existing) {
+      pending.assistantMessageId = existing.info.id;
+      pending.observed = true;
+    }
     await this.refresh(pending);
     return pending.promise;
   }
 
-  async abort(sessionId: string): Promise<void> {
+  async abort(sessionId: string, directory: string): Promise<void> {
     await this.ensureServer();
-    return this.client.abort(sessionId);
+    return this.client.abort(sessionId, directory);
   }
 
-  async close(sessionId: string): Promise<void> {
+  async close(sessionId: string, directory: string): Promise<void> {
     await this.ensureServer();
-    return this.client.close(sessionId);
+    return this.client.close(sessionId, directory);
   }
 
   async stop(): Promise<void> {
@@ -420,7 +443,9 @@ export class ManagedOpenCode implements OpenCodePort {
           typeof properties.sessionID === "string" &&
           this.pending.has(properties.sessionID)
         ) {
-          void this.client.approvePermission(properties.id).catch((error) => {
+          const pending = this.pending.get(properties.sessionID);
+          if (!pending) break;
+          void this.client.approvePermission(properties.id, pending.directory).catch((error) => {
             this.failSession(properties.sessionID, error);
           });
         }
@@ -432,7 +457,9 @@ export class ManagedOpenCode implements OpenCodePort {
           typeof properties.sessionID === "string" &&
           this.pending.has(properties.sessionID)
         ) {
-          void this.client.rejectQuestion(properties.id).catch((error) => {
+          const pending = this.pending.get(properties.sessionID);
+          if (!pending) break;
+          void this.client.rejectQuestion(properties.id, pending.directory).catch((error) => {
             this.failSession(properties.sessionID, error);
           });
         }
@@ -440,31 +467,52 @@ export class ManagedOpenCode implements OpenCodePort {
       case "message.updated": {
         const info = properties.info;
         if (!info || typeof info !== "object") break;
-        const message = info as { id?: unknown; role?: unknown; parentID?: unknown; error?: unknown };
-        const pending = typeof properties.sessionID === "string" ? this.pending.get(properties.sessionID) : undefined;
-        if (
+        const message = info as {
+          id?: unknown;
+          sessionID?: unknown;
+          role?: unknown;
+          parentID?: unknown;
+          error?: unknown;
+          finish?: unknown;
+          time?: { completed?: unknown };
+        };
+        const sessionId =
+          typeof message.sessionID === "string"
+            ? message.sessionID
+            : typeof properties.sessionID === "string"
+              ? properties.sessionID
+              : undefined;
+        const pending = sessionId ? this.pending.get(sessionId) : undefined;
+        if (pending && message.role === "user" && message.id === pending.userMessageId) {
+          pending.observed = true;
+        } else if (
+          sessionId !== undefined &&
           pending &&
           message.role === "assistant" &&
           message.parentID === pending.userMessageId &&
           typeof message.id === "string"
         ) {
+          pending.observed = true;
           pending.assistantMessageId = message.id;
           if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
+          else if (message.time?.completed || message.finish) void this.finish(sessionId);
         }
         break;
       }
       case "session.idle":
-        if (typeof properties.sessionID === "string") void this.finish(properties.sessionID);
+        if (typeof properties.sessionID === "string") {
+          const pending = this.pending.get(properties.sessionID);
+          if (pending) void this.refresh(pending);
+        }
         break;
       case "session.status": {
         const status = properties.status;
-        if (
-          typeof properties.sessionID === "string" &&
-          status &&
-          typeof status === "object" &&
-          (status as { type?: unknown }).type === "idle"
-        ) {
-          void this.finish(properties.sessionID);
+        if (typeof properties.sessionID === "string" && status && typeof status === "object") {
+          const pending = this.pending.get(properties.sessionID);
+          if (!pending) break;
+          const type = (status as { type?: unknown }).type;
+          if (type === "busy" || type === "retry") pending.observed = true;
+          else if (type === "idle") void this.refresh(pending);
         }
         break;
       }
@@ -474,7 +522,13 @@ export class ManagedOpenCode implements OpenCodePort {
     }
   }
 
-  private watch(sessionId: string, userMessageId: string, signal: AbortSignal): PendingTurn {
+  private watch(
+    sessionId: string,
+    directory: string,
+    userMessageId: string,
+    signal: AbortSignal,
+    failIfIdleWithoutResult: boolean,
+  ): PendingTurn {
     if (this.pending.has(sessionId)) {
       throw new OpenCodeFailure(
         "SESSION_BUSY",
@@ -490,11 +544,14 @@ export class ManagedOpenCode implements OpenCodePort {
     });
     const pending: PendingTurn = {
       sessionId,
+      directory,
       userMessageId,
       promise,
       signal,
       resolve,
       reject,
+      observed: false,
+      failIfIdleWithoutResult,
       finishing: false,
       abortListener: () => {
         this.rejectPending(
@@ -510,11 +567,13 @@ export class ManagedOpenCode implements OpenCodePort {
   }
 
   private async refresh(pending: PendingTurn): Promise<void> {
-    if (this.pending.get(pending.sessionId) !== pending) return;
+    if (this.pending.get(pending.sessionId) !== pending || pending.finishing) return;
     const assistant = pending.assistantMessageId
-      ? await this.client.getMessage(pending.sessionId, pending.assistantMessageId)
-      : await this.client.findAssistant(pending.sessionId, pending.userMessageId);
+      ? await this.client.getMessage(pending.sessionId, pending.directory, pending.assistantMessageId)
+      : await this.client.findAssistant(pending.sessionId, pending.directory, pending.userMessageId);
+    if (this.pending.get(pending.sessionId) !== pending) return;
     if (assistant) {
+      pending.observed = true;
       pending.assistantMessageId = assistant.info.id;
       if (assistant.info.error) {
         this.rejectPending(pending, errorFromAssistant(assistant.info.error));
@@ -525,7 +584,12 @@ export class ManagedOpenCode implements OpenCodePort {
         return;
       }
     }
-    if ((await this.client.sessionStatus(pending.sessionId)) === "idle") await this.finish(pending.sessionId);
+    const status = await this.client.sessionStatus(pending.sessionId, pending.directory);
+    if (status === "busy" || status === "retry") {
+      pending.observed = true;
+    } else if (pending.observed || pending.failIfIdleWithoutResult) {
+      await this.finish(pending.sessionId);
+    }
   }
 
   private async finish(sessionId: string): Promise<void> {
@@ -534,8 +598,8 @@ export class ManagedOpenCode implements OpenCodePort {
     pending.finishing = true;
     try {
       const message = pending.assistantMessageId
-        ? await this.client.getMessage(sessionId, pending.assistantMessageId)
-        : await this.client.findAssistant(sessionId, pending.userMessageId);
+        ? await this.client.getMessage(sessionId, pending.directory, pending.assistantMessageId)
+        : await this.client.findAssistant(sessionId, pending.directory, pending.userMessageId);
       if (!message) {
         throw new OpenCodeFailure(
           "MISSING_TURN_RESULT",
@@ -572,26 +636,28 @@ export class ManagedOpenCode implements OpenCodePort {
   }
 
   private async resolvePendingPrompts(): Promise<void> {
-    const [permissions, questions] = await Promise.all([
-      this.client.pendingPermissions(),
-      this.client.pendingQuestions(),
-    ]);
-    await Promise.allSettled([
-      ...permissions.flatMap((request) =>
-        typeof request.id === "string" &&
-        typeof request.sessionID === "string" &&
-        this.pending.has(request.sessionID)
-          ? [this.client.approvePermission(request.id)]
-          : [],
-      ),
-      ...questions.flatMap((request) =>
-        typeof request.id === "string" &&
-        typeof request.sessionID === "string" &&
-        this.pending.has(request.sessionID)
-          ? [this.client.rejectQuestion(request.id)]
-          : [],
-      ),
-    ]);
+    const directories = new Set<string>();
+    for (const pending of this.pending.values()) directories.add(pending.directory);
+    await Promise.all(
+      [...directories].map(async (directory) => {
+        const [permissions, questions] = await Promise.all([
+          this.client.pendingPermissions(directory),
+          this.client.pendingQuestions(directory),
+        ]);
+        const replies: Promise<void>[] = [];
+        for (const request of permissions) {
+          if (typeof request.id !== "string" || typeof request.sessionID !== "string") continue;
+          if (this.pending.get(request.sessionID)?.directory !== directory) continue;
+          replies.push(this.client.approvePermission(request.id, directory));
+        }
+        for (const request of questions) {
+          if (typeof request.id !== "string" || typeof request.sessionID !== "string") continue;
+          if (this.pending.get(request.sessionID)?.directory !== directory) continue;
+          replies.push(this.client.rejectQuestion(request.id, directory));
+        }
+        await Promise.allSettled(replies);
+      }),
+    );
   }
 }
 

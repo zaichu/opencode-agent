@@ -127,9 +127,15 @@ export function createWorkerRuntime(input: {
         );
       }
       const text = recovering
-        ? await input.client.recoverTurn(worker.sessionId, turn.openCodeMessageId, controller.signal)
+        ? await input.client.recoverTurn(
+            worker.sessionId,
+            worker.directory,
+            turn.openCodeMessageId,
+            controller.signal,
+          )
         : await input.client.runTurn(
             worker.sessionId,
+            worker.directory,
             turn.openCodeMessageId,
             {
               message: turn.message,
@@ -230,7 +236,7 @@ export function createWorkerRuntime(input: {
       try {
         registry.createWorkerAndTurn(worker, turn);
       } catch (error) {
-        await Promise.allSettled([input.client.close(sessionId)]);
+        await Promise.allSettled([input.client.close(sessionId, directory)]);
         throw error;
       }
       launch(turn, worker, false);
@@ -293,7 +299,7 @@ export function createWorkerRuntime(input: {
 
       controllers.get(interruptedTurnId)?.abort();
       signal(interruptedTurnId);
-      await Promise.allSettled([input.client.abort(worker.sessionId)]);
+      await Promise.allSettled([input.client.abort(worker.sessionId, worker.directory)]);
       startNext(workerId);
       return compact({ ...workerSnapshot(requiredWorker(workerId)), interruptedTurnId });
     },
@@ -308,8 +314,8 @@ export function createWorkerRuntime(input: {
         controllers.get(turnId)?.abort();
         signal(turnId);
       }
-      await Promise.allSettled([input.client.abort(worker.sessionId)]);
-      await Promise.allSettled([input.client.close(worker.sessionId)]);
+      await Promise.allSettled([input.client.abort(worker.sessionId, worker.directory)]);
+      await Promise.allSettled([input.client.close(worker.sessionId, worker.directory)]);
       return workerSnapshot(requiredWorker(workerId));
     },
 
@@ -391,8 +397,23 @@ function makeTurnId(): TurnId {
   return `trn_${crypto.randomUUID()}`;
 }
 
+let lastOpenCodeMessageTimestamp = 0;
+let openCodeMessageCounter = 0;
+
 function makeOpenCodeMessageId(): string {
-  return `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+  const timestamp = Date.now();
+  if (timestamp !== lastOpenCodeMessageTimestamp) {
+    lastOpenCodeMessageTimestamp = timestamp;
+    openCodeMessageCounter = 0;
+  }
+  openCodeMessageCounter++;
+
+  const sortable = (BigInt(timestamp) * 0x1000n + BigInt(openCodeMessageCounter)) & 0xffffffffffffn;
+  const bytes = crypto.getRandomValues(new Uint8Array(14));
+  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  let random = "";
+  for (const byte of bytes) random += alphabet[byte % alphabet.length];
+  return `msg_${sortable.toString(16).padStart(12, "0")}${random}`;
 }
 
 function isTerminal(status: TurnState): boolean {

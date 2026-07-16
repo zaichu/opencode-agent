@@ -37,6 +37,9 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
     server = Bun.serve({
       hostname: "127.0.0.1",
       port: config.daemonPort,
+      // `wait` intentionally has no public timeout; the client may stay attached
+      // for the full lifetime of a long-running OpenCode turn.
+      idleTimeout: 0,
       async fetch(request) {
         const url = new URL(request.url);
         if (request.method === "GET" && url.pathname === "/health") {

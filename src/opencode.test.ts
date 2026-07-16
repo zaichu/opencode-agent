@@ -98,6 +98,7 @@ test("permission asks are auto-approved only for an active adapter worker", asyn
     const session = await client.createSession({ directory: process.cwd() });
     const result = await client.runTurn(
       session,
+      process.cwd(),
       "msg_00000000000000000000000000000000",
       { message: "use a tool" },
       new AbortController().signal,
@@ -149,8 +150,207 @@ test("a completed OpenCode message is recovered by its durable user message ID",
   const client = new ManagedOpenCode(`http://127.0.0.1:${server.port}`);
   try {
     expect(
-      await client.recoverTurn("session-recovery", messageId, new AbortController().signal),
+      await client.recoverTurn(
+        "session-recovery",
+        process.cwd(),
+        messageId,
+        new AbortController().signal,
+      ),
     ).toBe("recovered result");
+  } finally {
+    await client.stop();
+    server.stop(true);
+  }
+});
+
+test("a real-shaped completed message event finishes without relying on session.idle", async () => {
+  const encoder = new TextEncoder();
+  const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const sessionId = "session-event-shape";
+  let assistant: Record<string, any> | undefined;
+
+  const emit = (payload: Record<string, unknown>): void => {
+    const chunk = encoder.encode(`data: ${JSON.stringify({ directory: process.cwd(), payload })}\n\n`);
+    for (const stream of streams) stream.enqueue(chunk);
+  };
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/global/health") return Response.json({ healthy: true });
+      if (url.pathname === "/permission" || url.pathname === "/question") return Response.json([]);
+      if (request.method === "POST" && url.pathname === "/session") {
+        return Response.json({ id: sessionId });
+      }
+      if (url.pathname === "/global/event") {
+        let controller: ReadableStreamDefaultController<Uint8Array>;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(value) {
+              controller = value;
+              streams.add(value);
+              value.enqueue(
+                encoder.encode(
+                  'data: {"payload":{"type":"server.connected","properties":{}}}\n\n',
+                ),
+              );
+            },
+            cancel() {
+              streams.delete(controller);
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      if (request.method === "POST" && url.pathname === `/session/${sessionId}/prompt_async`) {
+        const body = (await request.json()) as { messageID: string };
+        void (async () => {
+          await Bun.sleep(10);
+          assistant = {
+            info: {
+              id: "assistant-event-shape",
+              sessionID: sessionId,
+              role: "assistant",
+              parentID: body.messageID,
+              time: { created: 1, completed: 2 },
+              finish: "stop",
+            },
+            parts: [{ type: "text", text: "event-only result" }],
+          };
+          emit({ type: "message.updated", properties: { info: assistant.info } });
+        })();
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/session/status") {
+        return Response.json({ [sessionId]: { type: "busy" } });
+      }
+      if (url.pathname === `/session/${sessionId}/message`) {
+        return Response.json(assistant ? [assistant] : []);
+      }
+      if (url.pathname === `/session/${sessionId}/message/assistant-event-shape`) {
+        return assistant ? Response.json(assistant) : new Response("not found", { status: 404 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  const client = new ManagedOpenCode(`http://127.0.0.1:${server.port}`);
+  const controller = new AbortController();
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const turn = client.runTurn(
+      session,
+      process.cwd(),
+      "msg_22222222222222222222222222222222",
+      { message: "complete from the event" },
+      controller.signal,
+    );
+    const result = await Promise.race([
+      turn,
+      Bun.sleep(250).then(() => "__timed_out__"),
+    ]);
+    if (result === "__timed_out__") {
+      controller.abort();
+      await turn.catch(() => undefined);
+    }
+    expect(result).toBe("event-only result");
+  } finally {
+    await client.stop();
+    server.stop(true);
+  }
+});
+
+test("an idle status immediately after prompt acceptance does not fail the turn", async () => {
+  const encoder = new TextEncoder();
+  const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const sessionId = "session-async-acceptance-race";
+  let assistant: Record<string, any> | undefined;
+
+  const emit = (payload: Record<string, unknown>): void => {
+    const chunk = encoder.encode(`data: ${JSON.stringify({ payload })}\n\n`);
+    for (const stream of streams) stream.enqueue(chunk);
+  };
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === "/global/health") return Response.json({ healthy: true });
+      if (url.pathname === "/permission" || url.pathname === "/question") return Response.json([]);
+      if (request.method === "POST" && url.pathname === "/session") {
+        return Response.json({ id: sessionId });
+      }
+      if (url.pathname === "/global/event") {
+        let controller: ReadableStreamDefaultController<Uint8Array>;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(value) {
+              controller = value;
+              streams.add(value);
+              value.enqueue(
+                encoder.encode('data: {"payload":{"type":"server.connected","properties":{}}}\n\n'),
+              );
+            },
+            cancel() {
+              streams.delete(controller);
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      if (request.method === "POST" && url.pathname === `/session/${sessionId}/prompt_async`) {
+        const body = (await request.json()) as { messageID: string };
+        void (async () => {
+          await Bun.sleep(20);
+          assistant = {
+            info: {
+              id: "assistant-after-acceptance-race",
+              sessionID: sessionId,
+              role: "assistant",
+              parentID: body.messageID,
+              time: { created: 1, completed: 2 },
+              finish: "stop",
+            },
+            parts: [{ type: "text", text: "accepted result" }],
+          };
+          emit({ type: "message.updated", properties: { info: assistant.info } });
+          emit({ type: "session.idle", properties: { sessionID: sessionId } });
+        })();
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === "/session/status") {
+        return Response.json({ [sessionId]: { type: "idle" } });
+      }
+      if (url.pathname === `/session/${sessionId}/message`) {
+        return Response.json(assistant ? [assistant] : []);
+      }
+      if (url.pathname === `/session/${sessionId}/message/assistant-after-acceptance-race`) {
+        return assistant ? Response.json(assistant) : new Response("not found", { status: 404 });
+      }
+      return new Response("not found", { status: 404 });
+    },
+  });
+
+  const client = new ManagedOpenCode(`http://127.0.0.1:${server.port}`);
+  const controller = new AbortController();
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const turn = client.runTurn(
+      session,
+      process.cwd(),
+      "msg_33333333333333333333333333",
+      { message: "complete after async acceptance" },
+      controller.signal,
+    );
+    const result = await Promise.race([turn, Bun.sleep(250).then(() => "__timed_out__")]);
+    if (result === "__timed_out__") {
+      controller.abort();
+      await turn.catch(() => undefined);
+    }
+    expect(result).toBe("accepted result");
   } finally {
     await client.stop();
     server.stop(true);

@@ -114,10 +114,12 @@ class FakeOpenCode implements OpenCodePort {
 
   async runTurn(
     _sessionId: string,
+    _directory: string,
     _messageId: string,
     input: { message: string },
     signal: AbortSignal,
   ): Promise<string> {
+    expect(_messageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
     this.started.push(input.message);
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
@@ -131,6 +133,7 @@ class FakeOpenCode implements OpenCodePort {
 
   async recoverTurn(
     sessionId: string,
+    _directory: string,
     messageId: string,
     signal: AbortSignal,
   ): Promise<string> {
