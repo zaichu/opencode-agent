@@ -7,7 +7,13 @@ export interface OpenCodePort {
     input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
   ): Promise<string>;
-  recoverTurn(sessionId: string, directory: string, messageId: string, signal: AbortSignal): Promise<string>;
+  recoverTurn(
+    sessionId: string,
+    directory: string,
+    messageId: string,
+    input: { message: string; agent?: string; model?: string },
+    signal: AbortSignal,
+  ): Promise<string>;
   abort(sessionId: string, directory: string): Promise<void>;
   close(sessionId: string, directory: string): Promise<void>;
 }
@@ -32,7 +38,6 @@ interface PendingTurn {
   readonly signal: AbortSignal;
   resolve(value: string): void;
   reject(error: unknown): void;
-  assistantMessageId?: string;
   observed: boolean;
   readonly failIfIdleWithoutResult: boolean;
   finishing: boolean;
@@ -107,26 +112,19 @@ export class OpenCodeClient {
     return status === "busy" || status === "retry" ? status : "idle";
   }
 
-  async getMessage(sessionId: string, directory: string, messageId: string): Promise<MessageEnvelope> {
-    const response = await this.request(
-      this.directoryUrl(
-        `/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
-        directory,
-      ),
-    );
-    return (await response.json()) as MessageEnvelope;
-  }
-
   async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
-    const response = await this.request(
-      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
-    );
-    const messages = (await response.json()) as MessageEnvelope[];
+    const messages = await this.messages(sessionId, directory);
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index]!;
       if (message.info.role === "assistant" && message.info.parentID === userMessageId) return message;
     }
     return null;
+  }
+
+  async hasUserMessage(sessionId: string, directory: string, messageId: string): Promise<boolean> {
+    return (await this.messages(sessionId, directory)).some(
+      (message) => message.info.role === "user" && message.info.id === messageId,
+    );
   }
 
   async openGlobalEvents(signal: AbortSignal): Promise<Response> {
@@ -211,6 +209,13 @@ export class OpenCodeClient {
     url.searchParams.set("directory", directory);
     return url;
   }
+
+  private async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
+    const response = await this.request(
+      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
+    );
+    return (await response.json()) as MessageEnvelope[];
+  }
 }
 
 export class ManagedOpenCode implements OpenCodePort {
@@ -258,17 +263,22 @@ export class ManagedOpenCode implements OpenCodePort {
     sessionId: string,
     directory: string,
     messageId: string,
+    input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
   ): Promise<string> {
     await this.ensureRunning();
     const existing = await this.client.findAssistant(sessionId, directory, messageId);
     if (existing && isComplete(existing)) return resultText(existing);
+    if (
+      !existing &&
+      !(await this.client.hasUserMessage(sessionId, directory, messageId)) &&
+      (await this.client.sessionStatus(sessionId, directory)) === "idle"
+    ) {
+      return this.runTurn(sessionId, directory, messageId, input, signal);
+    }
 
     const pending = this.watch(sessionId, directory, messageId, signal, true);
-    if (existing) {
-      pending.assistantMessageId = existing.info.id;
-      pending.observed = true;
-    }
+    if (existing) pending.observed = true;
     await this.refresh(pending);
     return pending.promise;
   }
@@ -483,9 +493,7 @@ export class ManagedOpenCode implements OpenCodePort {
               ? properties.sessionID
               : undefined;
         const pending = sessionId ? this.pending.get(sessionId) : undefined;
-        if (pending && message.role === "user" && message.id === pending.userMessageId) {
-          pending.observed = true;
-        } else if (
+        if (
           sessionId !== undefined &&
           pending &&
           message.role === "assistant" &&
@@ -493,9 +501,8 @@ export class ManagedOpenCode implements OpenCodePort {
           typeof message.id === "string"
         ) {
           pending.observed = true;
-          pending.assistantMessageId = message.id;
           if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
-          else if (message.time?.completed || message.finish) void this.finish(sessionId);
+          else if (isTerminalMessage(message)) void this.finish(sessionId);
         }
         break;
       }
@@ -568,18 +575,19 @@ export class ManagedOpenCode implements OpenCodePort {
 
   private async refresh(pending: PendingTurn): Promise<void> {
     if (this.pending.get(pending.sessionId) !== pending || pending.finishing) return;
-    const assistant = pending.assistantMessageId
-      ? await this.client.getMessage(pending.sessionId, pending.directory, pending.assistantMessageId)
-      : await this.client.findAssistant(pending.sessionId, pending.directory, pending.userMessageId);
+    const assistant = await this.client.findAssistant(
+      pending.sessionId,
+      pending.directory,
+      pending.userMessageId,
+    );
     if (this.pending.get(pending.sessionId) !== pending) return;
     if (assistant) {
       pending.observed = true;
-      pending.assistantMessageId = assistant.info.id;
       if (assistant.info.error) {
         this.rejectPending(pending, errorFromAssistant(assistant.info.error));
         return;
       }
-      if (isComplete(assistant)) {
+      if (isTerminalMessage(assistant.info)) {
         this.resolvePending(pending, resultText(assistant));
         return;
       }
@@ -597,10 +605,9 @@ export class ManagedOpenCode implements OpenCodePort {
     if (!pending || pending.finishing) return;
     pending.finishing = true;
     try {
-      const message = pending.assistantMessageId
-        ? await this.client.getMessage(sessionId, pending.directory, pending.assistantMessageId)
-        : await this.client.findAssistant(sessionId, pending.directory, pending.userMessageId);
-      if (!message) {
+      const message = await this.client.findAssistant(sessionId, pending.directory, pending.userMessageId);
+      if (!message || !isTerminalMessage(message.info)) {
+        if (!pending.failIfIdleWithoutResult) return;
         throw new OpenCodeFailure(
           "MISSING_TURN_RESULT",
           `OpenCode session ${sessionId} became idle without an assistant result.`,
@@ -686,7 +693,17 @@ function resultText(message: MessageEnvelope): string {
 }
 
 function isComplete(message: MessageEnvelope): boolean {
-  return Boolean(message.info.error || message.info.time?.completed || message.info.finish);
+  return isTerminalMessage(message.info);
+}
+
+function isTerminalMessage(info: {
+  error?: unknown;
+  finish?: unknown;
+  time?: { completed?: unknown };
+}): boolean {
+  if (info.error) return true;
+  if (info.finish === "tool-calls") return false;
+  return Boolean(info.finish || info.time?.completed);
 }
 
 function errorFromAssistant(error: unknown): OpenCodeFailure {

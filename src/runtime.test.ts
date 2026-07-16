@@ -135,6 +135,7 @@ class FakeOpenCode implements OpenCodePort {
     sessionId: string,
     _directory: string,
     messageId: string,
+    _input: { message: string },
     signal: AbortSignal,
   ): Promise<string> {
     await sleep(5, signal);

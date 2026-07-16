@@ -131,6 +131,11 @@ export function createWorkerRuntime(input: {
             worker.sessionId,
             worker.directory,
             turn.openCodeMessageId,
+            {
+              message: turn.message,
+              agent: turn.agent ?? worker.agent,
+              model: turn.model ?? worker.model,
+            },
             controller.signal,
           )
         : await input.client.runTurn(
