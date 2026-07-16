@@ -35,12 +35,10 @@ export interface FakeOpenCodeScenario {
 }
 
 export interface FakeOpenCode {
-  readonly port: number;
   readonly url: string;
   readonly approvals: string[];
   readonly submissions: number;
   session(id: string, directory?: string): FakeSession;
-  emit(type: string, properties: Record<string, unknown>): void;
   stop(): void;
 }
 
@@ -229,12 +227,10 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
   const port = server.port;
   if (!port) throw new Error("Bun did not allocate a fake OpenCode port.");
   return {
-    port,
     url: `http://127.0.0.1:${port}`,
     approvals,
     get submissions() { return submissions; },
     session,
-    emit,
     stop() { server.stop(true); },
   };
 }

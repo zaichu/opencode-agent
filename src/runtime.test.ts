@@ -3,13 +3,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpenCodePort } from "./opencode.ts";
-import { createWorkerRuntime, disposeRuntime, type HostedWorkerRuntime } from "./runtime.ts";
+import { createWorkerRuntime, type HostedWorkerRuntime } from "./runtime.ts";
 
 const temporaryDirectories: string[] = [];
 const runtimes: HostedWorkerRuntime[] = [];
 
 afterEach(async () => {
-  await Promise.allSettled(runtimes.splice(0).map((runtime) => runtime[disposeRuntime]()));
+  await Promise.allSettled(runtimes.splice(0).map((runtime) => runtime[Symbol.asyncDispose]()));
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
@@ -64,7 +64,7 @@ test("active turns reconcile after the runtime is replaced", async () => {
   runtimes.push(firstRuntime);
 
   const spawned = await firstRuntime.spawn({ task: "survive restart", directory });
-  await firstRuntime[disposeRuntime]();
+  await firstRuntime[Symbol.asyncDispose]();
 
   const replacement = createWorkerRuntime({ client, stateFile });
   runtimes.push(replacement);

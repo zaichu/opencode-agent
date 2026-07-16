@@ -69,7 +69,7 @@ export async function daemonToken(dataRoot: string): Promise<string> {
   }
 }
 
-export async function canonicalDirectory(path: string): Promise<string> {
+async function canonicalDirectory(path: string): Promise<string> {
   try {
     const canonical = await realpath(resolve(path));
     if (!(await stat(canonical)).isDirectory()) throw new Error("not a directory");

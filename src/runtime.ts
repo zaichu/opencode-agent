@@ -88,8 +88,7 @@ export class RuntimeError extends Error {
   }
 }
 
-export const disposeRuntime = Symbol("disposeWorkerRuntime");
-export type HostedWorkerRuntime = WorkerRuntime & { [disposeRuntime](): Promise<void> };
+export type HostedWorkerRuntime = WorkerRuntime & AsyncDisposable;
 
 interface TurnLatch {
   promise: Promise<void>;
@@ -295,7 +294,7 @@ export function createWorkerRuntime(input: {
       return workerSnapshot(requiredWorker(workerId));
     },
 
-    [disposeRuntime]() {
+    [Symbol.asyncDispose]() {
       if (disposePromise) return disposePromise;
       disposing = true;
       for (const controller of controllers.values()) controller.abort();

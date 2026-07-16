@@ -7,7 +7,6 @@ import { ProtocolError, decodeCommand, type DecodedCommand, type ErrorBody, type
 import {
   RuntimeError,
   createWorkerRuntime,
-  disposeRuntime,
   type HostedWorkerRuntime,
   type WorkerRuntime,
 } from "./runtime.ts";
@@ -85,7 +84,7 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
     if (stopping) return;
     stopping = true;
     server.stop(true);
-    await Promise.allSettled([...runtimes.values()].map((runtime) => runtime[disposeRuntime]()));
+    await Promise.allSettled([...runtimes.values()].map((runtime) => runtime[Symbol.asyncDispose]()));
     runtimes.clear();
     await openCode.stop();
     await lock.release();

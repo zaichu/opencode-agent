@@ -2,9 +2,6 @@ import type { TurnId, WorkerId } from "./runtime.ts";
 
 export type Scope = { scope: "global" } | { scope: "project"; projectRoot: string };
 
-export const OPERATIONS = ["spawn", "list", "status", "followup", "wait", "interrupt", "close"] as const;
-export type Operation = (typeof OPERATIONS)[number];
-
 type CommandFor<Worker extends string, Turn extends string> =
   | {
       scope: Scope;
