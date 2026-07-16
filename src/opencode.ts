@@ -1,0 +1,662 @@
+export interface OpenCodePort {
+  createSession(input: { directory: string; label?: string }): Promise<string>;
+  runTurn(
+    sessionId: string,
+    messageId: string,
+    input: { message: string; agent?: string; model?: string },
+    signal: AbortSignal,
+  ): Promise<string>;
+  recoverTurn(sessionId: string, messageId: string, signal: AbortSignal): Promise<string>;
+  abort(sessionId: string): Promise<void>;
+  close(sessionId: string): Promise<void>;
+}
+
+interface MessageEnvelope {
+  info: {
+    id: string;
+    role: "user" | "assistant";
+    parentID?: string;
+    time?: { created?: number; completed?: number };
+    finish?: string;
+    error?: unknown;
+  };
+  parts: Array<{ type?: string; text?: string }>;
+}
+
+interface PendingTurn {
+  readonly sessionId: string;
+  readonly userMessageId: string;
+  readonly promise: Promise<string>;
+  readonly signal: AbortSignal;
+  resolve(value: string): void;
+  reject(error: unknown): void;
+  assistantMessageId?: string;
+  finishing: boolean;
+  abortListener(): void;
+}
+
+export class OpenCodeFailure extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retryable: boolean,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+export class OpenCodeClient {
+  constructor(private readonly baseUrl = "http://127.0.0.1:4096") {}
+
+  async health(): Promise<{ healthy: true; version?: string } | null> {
+    try {
+      const response = await fetch(new URL("/global/health", this.baseUrl));
+      if (!response.ok) return null;
+      const body = (await response.json()) as { healthy?: unknown; version?: unknown };
+      return body.healthy === true
+        ? { healthy: true, version: typeof body.version === "string" ? body.version : undefined }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async createSession(input: { directory: string; label?: string }): Promise<string> {
+    const url = new URL("/session", this.baseUrl);
+    url.searchParams.set("directory", input.directory);
+    const response = await this.request(url, {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(input.label ? { title: input.label } : {}),
+    });
+    const session = (await response.json()) as { id?: unknown };
+    if (typeof session.id !== "string") {
+      throw new OpenCodeFailure("INVALID_OPENCODE_RESPONSE", "OpenCode returned a session without an ID.", false);
+    }
+    return session.id;
+  }
+
+  async promptAsync(
+    sessionId: string,
+    messageId: string,
+    input: { message: string; agent?: string; model?: string },
+  ): Promise<void> {
+    const body: Record<string, unknown> = {
+      messageID: messageId,
+      parts: [{ type: "text", text: input.message }],
+    };
+    if (input.agent) body.agent = input.agent;
+    if (input.model) body.model = parseModel(input.model);
+    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}/prompt_async`, this.baseUrl), {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify(body),
+    });
+  }
+
+  async sessionStatus(sessionId: string): Promise<"busy" | "idle" | "retry"> {
+    const response = await this.request(new URL("/session/status", this.baseUrl));
+    const statuses = (await response.json()) as Record<string, { type?: unknown }>;
+    const status = statuses[sessionId]?.type;
+    return status === "busy" || status === "retry" ? status : "idle";
+  }
+
+  async getMessage(sessionId: string, messageId: string): Promise<MessageEnvelope> {
+    const response = await this.request(
+      new URL(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`, this.baseUrl),
+    );
+    return (await response.json()) as MessageEnvelope;
+  }
+
+  async findAssistant(sessionId: string, userMessageId: string): Promise<MessageEnvelope | null> {
+    const response = await this.request(
+      new URL(`/session/${encodeURIComponent(sessionId)}/message`, this.baseUrl),
+    );
+    const messages = (await response.json()) as MessageEnvelope[];
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]!;
+      if (message.info.role === "assistant" && message.info.parentID === userMessageId) return message;
+    }
+    return null;
+  }
+
+  async openGlobalEvents(signal: AbortSignal): Promise<Response> {
+    const response = await this.request(new URL("/global/event", this.baseUrl), {
+      headers: { accept: "text/event-stream" },
+      signal,
+    });
+    if (!response.body) {
+      throw new OpenCodeFailure("INVALID_OPENCODE_RESPONSE", "OpenCode returned an empty event stream.", true);
+    }
+    return response;
+  }
+
+  async pendingPermissions(): Promise<Array<{ id?: string; sessionID?: string }>> {
+    const response = await this.request(new URL("/permission", this.baseUrl));
+    return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
+  }
+
+  async approvePermission(requestId: string): Promise<void> {
+    await this.request(new URL(`/permission/${encodeURIComponent(requestId)}/reply`, this.baseUrl), {
+      method: "POST",
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ reply: "once" }),
+    });
+  }
+
+  async pendingQuestions(): Promise<Array<{ id?: string; sessionID?: string }>> {
+    const response = await this.request(new URL("/question", this.baseUrl));
+    return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
+  }
+
+  async rejectQuestion(requestId: string): Promise<void> {
+    await this.request(new URL(`/question/${encodeURIComponent(requestId)}/reject`, this.baseUrl), {
+      method: "POST",
+    });
+  }
+
+  async abort(sessionId: string): Promise<void> {
+    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}/abort`, this.baseUrl), {
+      method: "POST",
+    });
+  }
+
+  async close(sessionId: string): Promise<void> {
+    await this.request(new URL(`/session/${encodeURIComponent(sessionId)}`, this.baseUrl), {
+      method: "DELETE",
+    });
+  }
+
+  private async request(url: URL, init: RequestInit = {}): Promise<Response> {
+    let response: Response;
+    try {
+      response = await fetch(url, init);
+    } catch (error) {
+      if (init.signal?.aborted) {
+        throw new OpenCodeFailure("TURN_INTERRUPTED", "The OpenCode turn was interrupted.", false);
+      }
+      throw new OpenCodeFailure(
+        "OPENCODE_UNAVAILABLE",
+        `Cannot reach OpenCode at ${this.baseUrl}: ${messageOf(error)}`,
+        true,
+      );
+    }
+
+    if (!response.ok) {
+      const detail = (await response.text()).trim().slice(0, 4096);
+      const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+      throw new OpenCodeFailure(
+        response.status === 404 ? "OPENCODE_NOT_FOUND" : `OPENCODE_HTTP_${response.status}`,
+        `OpenCode ${init.method ?? "GET"} ${url.pathname} failed (${response.status})${
+          detail ? `: ${detail}` : ""
+        }`,
+        retryable,
+        response.status,
+      );
+    }
+    return response;
+  }
+}
+
+export class ManagedOpenCode implements OpenCodePort {
+  private readonly client: OpenCodeClient;
+  private readonly eventAbort = new AbortController();
+  private readonly pending = new Map<string, PendingTurn>();
+  private child?: ReturnType<typeof Bun.spawn>;
+  private starting?: Promise<void>;
+  private eventsReady?: Promise<void>;
+  private reconnecting?: Promise<void>;
+  private stopped = false;
+
+  constructor(
+    private readonly baseUrl = "http://127.0.0.1:4096",
+    private readonly executable = "opencode",
+  ) {
+    this.client = new OpenCodeClient(baseUrl);
+  }
+
+  async createSession(input: { directory: string; label?: string }): Promise<string> {
+    await this.ensureRunning();
+    return this.client.createSession(input);
+  }
+
+  async runTurn(
+    sessionId: string,
+    messageId: string,
+    input: { message: string; agent?: string; model?: string },
+    signal: AbortSignal,
+  ): Promise<string> {
+    await this.ensureRunning();
+    const pending = this.watch(sessionId, messageId, signal);
+    try {
+      await this.client.promptAsync(sessionId, messageId, input);
+      await this.refresh(pending);
+      return await pending.promise;
+    } catch (error) {
+      this.rejectPending(pending, error);
+      throw error;
+    }
+  }
+
+  async recoverTurn(sessionId: string, messageId: string, signal: AbortSignal): Promise<string> {
+    await this.ensureRunning();
+    const existing = await this.client.findAssistant(sessionId, messageId);
+    if (existing && isComplete(existing)) return resultText(existing);
+
+    const pending = this.watch(sessionId, messageId, signal);
+    if (existing) pending.assistantMessageId = existing.info.id;
+    await this.refresh(pending);
+    return pending.promise;
+  }
+
+  async abort(sessionId: string): Promise<void> {
+    await this.ensureServer();
+    return this.client.abort(sessionId);
+  }
+
+  async close(sessionId: string): Promise<void> {
+    await this.ensureServer();
+    return this.client.close(sessionId);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.eventAbort.abort();
+    for (const pending of this.pending.values()) {
+      pending.reject(new OpenCodeFailure("OPENCODE_STOPPED", "The OpenCode host stopped.", true));
+      pending.signal.removeEventListener("abort", pending.abortListener);
+    }
+    this.pending.clear();
+
+    const child = this.child;
+    this.child = undefined;
+    if (!child || child.exitCode !== null) return;
+    child.kill();
+    await child.exited;
+  }
+
+  private async ensureRunning(): Promise<void> {
+    await this.ensureServer();
+    await this.ensureEvents();
+  }
+
+  private ensureServer(): Promise<void> {
+    this.starting ??= this.startServer().finally(() => {
+      this.starting = undefined;
+    });
+    return this.starting;
+  }
+
+  private async startServer(): Promise<void> {
+    if (await this.client.health()) return;
+
+    const url = new URL(this.baseUrl);
+    if (url.protocol !== "http:" || !isLocalHost(url.hostname)) {
+      throw new OpenCodeFailure(
+        "OPENCODE_UNAVAILABLE",
+        `OpenCode at ${this.baseUrl} is unavailable and cannot be started locally.`,
+        true,
+      );
+    }
+
+    const port = url.port || "80";
+    this.child = Bun.spawn({
+      cmd: [this.executable, "serve", "--hostname", url.hostname, "--port", port],
+      stdin: "ignore",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+
+    for (let attempt = 0; attempt < 150; attempt++) {
+      if (await this.client.health()) return;
+      if (this.child.exitCode !== null) break;
+      await Bun.sleep(100);
+    }
+
+    const exit = this.child.exitCode;
+    this.child = undefined;
+    throw new OpenCodeFailure(
+      "OPENCODE_START_FAILED",
+      `OpenCode did not become healthy at ${this.baseUrl}${
+        exit === null ? "." : ` (process exited with code ${exit}).`
+      }`,
+      true,
+    );
+  }
+
+  private ensureEvents(): Promise<void> {
+    this.eventsReady ??= this.connectEvents().catch((error) => {
+      this.eventsReady = undefined;
+      throw error;
+    });
+    return this.eventsReady;
+  }
+
+  private async connectEvents(): Promise<void> {
+    const response = await this.client.openGlobalEvents(this.eventAbort.signal);
+    void this.consumeEvents(response)
+      .catch(() => {
+        // A broken or aborted stream is recovered by the reconnect path below.
+      })
+      .finally(() => {
+        this.eventsReady = undefined;
+        if (!this.stopped) this.scheduleReconnect();
+      });
+    await this.resolvePendingPrompts();
+    for (const pending of this.pending.values()) void this.refresh(pending);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnecting || this.stopped) return;
+    this.reconnecting = (async () => {
+      while (!this.stopped) {
+        try {
+          await this.ensureServer();
+          await this.ensureEvents();
+          return;
+        } catch {
+          await Bun.sleep(250);
+        }
+      }
+    })().finally(() => {
+      this.reconnecting = undefined;
+    });
+  }
+
+  private async consumeEvents(response: Response): Promise<void> {
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let data = "";
+    try {
+      while (!this.stopped) {
+        const chunk = await reader.read();
+        if (chunk.done) return;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let start = 0;
+        while (true) {
+          const newline = buffer.indexOf("\n", start);
+          if (newline < 0) break;
+          const line = buffer.slice(start, newline);
+          start = newline + 1;
+          if (line === "" || line === "\r") {
+            if (data) this.handleEvent(data);
+            data = "";
+          } else if (line.startsWith("data:")) {
+            const value = line.charCodeAt(5) === 32 ? line.slice(6) : line.slice(5);
+            data = data ? `${data}\n${value}` : value;
+          }
+        }
+        if (start > 0) buffer = buffer.slice(start);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private handleEvent(data: string): void {
+    if (!isRelevantEvent(data)) return;
+    let value: unknown;
+    try {
+      value = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const wrapper = value as { payload?: unknown; type?: unknown; properties?: unknown };
+    const payload =
+      wrapper.payload && typeof wrapper.payload === "object"
+        ? (wrapper.payload as { type?: unknown; properties?: unknown })
+        : wrapper;
+    if (typeof payload.type !== "string" || !payload.properties || typeof payload.properties !== "object") return;
+    const properties = payload.properties as Record<string, unknown>;
+
+    switch (payload.type) {
+      case "permission.asked":
+      case "permission.v2.asked":
+        if (
+          typeof properties.id === "string" &&
+          typeof properties.sessionID === "string" &&
+          this.pending.has(properties.sessionID)
+        ) {
+          void this.client.approvePermission(properties.id).catch((error) => {
+            this.failSession(properties.sessionID, error);
+          });
+        }
+        break;
+      case "question.asked":
+      case "question.v2.asked":
+        if (
+          typeof properties.id === "string" &&
+          typeof properties.sessionID === "string" &&
+          this.pending.has(properties.sessionID)
+        ) {
+          void this.client.rejectQuestion(properties.id).catch((error) => {
+            this.failSession(properties.sessionID, error);
+          });
+        }
+        break;
+      case "message.updated": {
+        const info = properties.info;
+        if (!info || typeof info !== "object") break;
+        const message = info as { id?: unknown; role?: unknown; parentID?: unknown; error?: unknown };
+        const pending = typeof properties.sessionID === "string" ? this.pending.get(properties.sessionID) : undefined;
+        if (
+          pending &&
+          message.role === "assistant" &&
+          message.parentID === pending.userMessageId &&
+          typeof message.id === "string"
+        ) {
+          pending.assistantMessageId = message.id;
+          if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
+        }
+        break;
+      }
+      case "session.idle":
+        if (typeof properties.sessionID === "string") void this.finish(properties.sessionID);
+        break;
+      case "session.status": {
+        const status = properties.status;
+        if (
+          typeof properties.sessionID === "string" &&
+          status &&
+          typeof status === "object" &&
+          (status as { type?: unknown }).type === "idle"
+        ) {
+          void this.finish(properties.sessionID);
+        }
+        break;
+      }
+      case "session.error":
+        this.failSession(properties.sessionID, errorFromAssistant(properties.error));
+        break;
+    }
+  }
+
+  private watch(sessionId: string, userMessageId: string, signal: AbortSignal): PendingTurn {
+    if (this.pending.has(sessionId)) {
+      throw new OpenCodeFailure(
+        "SESSION_BUSY",
+        `OpenCode session ${sessionId} already has an active turn.`,
+        false,
+      );
+    }
+    let resolve!: (value: string) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<string>((done, fail) => {
+      resolve = done;
+      reject = fail;
+    });
+    const pending: PendingTurn = {
+      sessionId,
+      userMessageId,
+      promise,
+      signal,
+      resolve,
+      reject,
+      finishing: false,
+      abortListener: () => {
+        this.rejectPending(
+          pending,
+          new OpenCodeFailure("TURN_INTERRUPTED", "The OpenCode turn was interrupted.", false),
+        );
+      },
+    };
+    this.pending.set(sessionId, pending);
+    signal.addEventListener("abort", pending.abortListener, { once: true });
+    if (signal.aborted) pending.abortListener();
+    return pending;
+  }
+
+  private async refresh(pending: PendingTurn): Promise<void> {
+    if (this.pending.get(pending.sessionId) !== pending) return;
+    const assistant = pending.assistantMessageId
+      ? await this.client.getMessage(pending.sessionId, pending.assistantMessageId)
+      : await this.client.findAssistant(pending.sessionId, pending.userMessageId);
+    if (assistant) {
+      pending.assistantMessageId = assistant.info.id;
+      if (assistant.info.error) {
+        this.rejectPending(pending, errorFromAssistant(assistant.info.error));
+        return;
+      }
+      if (isComplete(assistant)) {
+        this.resolvePending(pending, resultText(assistant));
+        return;
+      }
+    }
+    if ((await this.client.sessionStatus(pending.sessionId)) === "idle") await this.finish(pending.sessionId);
+  }
+
+  private async finish(sessionId: string): Promise<void> {
+    const pending = this.pending.get(sessionId);
+    if (!pending || pending.finishing) return;
+    pending.finishing = true;
+    try {
+      const message = pending.assistantMessageId
+        ? await this.client.getMessage(sessionId, pending.assistantMessageId)
+        : await this.client.findAssistant(sessionId, pending.userMessageId);
+      if (!message) {
+        throw new OpenCodeFailure(
+          "MISSING_TURN_RESULT",
+          `OpenCode session ${sessionId} became idle without an assistant result.`,
+          true,
+        );
+      }
+      this.resolvePending(pending, resultText(message));
+    } catch (error) {
+      this.rejectPending(pending, error);
+    } finally {
+      pending.finishing = false;
+    }
+  }
+
+  private resolvePending(pending: PendingTurn, text: string): void {
+    if (this.pending.get(pending.sessionId) !== pending) return;
+    this.pending.delete(pending.sessionId);
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    pending.resolve(text);
+  }
+
+  private rejectPending(pending: PendingTurn, error: unknown): void {
+    if (this.pending.get(pending.sessionId) !== pending) return;
+    this.pending.delete(pending.sessionId);
+    pending.signal.removeEventListener("abort", pending.abortListener);
+    pending.reject(error);
+  }
+
+  private failSession(sessionId: unknown, error: unknown): void {
+    if (typeof sessionId !== "string") return;
+    const pending = this.pending.get(sessionId);
+    if (pending) this.rejectPending(pending, error);
+  }
+
+  private async resolvePendingPrompts(): Promise<void> {
+    const [permissions, questions] = await Promise.all([
+      this.client.pendingPermissions(),
+      this.client.pendingQuestions(),
+    ]);
+    await Promise.allSettled([
+      ...permissions.flatMap((request) =>
+        typeof request.id === "string" &&
+        typeof request.sessionID === "string" &&
+        this.pending.has(request.sessionID)
+          ? [this.client.approvePermission(request.id)]
+          : [],
+      ),
+      ...questions.flatMap((request) =>
+        typeof request.id === "string" &&
+        typeof request.sessionID === "string" &&
+        this.pending.has(request.sessionID)
+          ? [this.client.rejectQuestion(request.id)]
+          : [],
+      ),
+    ]);
+  }
+}
+
+const JSON_HEADERS = { "content-type": "application/json" } as const;
+
+function parseModel(model: string): { providerID: string; modelID: string } {
+  const separator = model.indexOf("/");
+  if (separator <= 0 || separator === model.length - 1) {
+    throw new OpenCodeFailure(
+      "INVALID_MODEL",
+      `Model must use provider/model format; received ${JSON.stringify(model)}.`,
+      false,
+    );
+  }
+  return { providerID: model.slice(0, separator), modelID: model.slice(separator + 1) };
+}
+
+function resultText(message: MessageEnvelope): string {
+  if (message.info.error) throw errorFromAssistant(message.info.error);
+  let result = "";
+  for (const part of message.parts) {
+    if (part.type !== "text" || typeof part.text !== "string") continue;
+    result = result ? `${result}\n${part.text}` : part.text;
+  }
+  return result;
+}
+
+function isComplete(message: MessageEnvelope): boolean {
+  return Boolean(message.info.error || message.info.time?.completed || message.info.finish);
+}
+
+function errorFromAssistant(error: unknown): OpenCodeFailure {
+  if (error instanceof OpenCodeFailure) return error;
+  if (error && typeof error === "object") {
+    const value = error as { name?: unknown; message?: unknown; data?: { message?: unknown; isRetryable?: unknown } };
+    const message =
+      typeof value.data?.message === "string"
+        ? value.data.message
+        : typeof value.message === "string"
+          ? value.message
+          : JSON.stringify(error).slice(0, 4096);
+    return new OpenCodeFailure(
+      typeof value.name === "string" ? `OPENCODE_${value.name.toUpperCase()}` : "OPENCODE_TURN_FAILED",
+      message,
+      value.data?.isRetryable === true,
+    );
+  }
+  return new OpenCodeFailure("OPENCODE_TURN_FAILED", String(error ?? "OpenCode turn failed."), false);
+}
+
+function isRelevantEvent(data: string): boolean {
+  return (
+    data.includes("permission.") ||
+    data.includes("question.") ||
+    data.includes("message.updated") ||
+    data.includes("session.idle") ||
+    data.includes("session.status") ||
+    data.includes("session.error")
+  );
+}
+
+function isLocalHost(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

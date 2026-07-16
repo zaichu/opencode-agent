@@ -1,0 +1,5 @@
+.agents
+.git
+node_modules
+coverage
+*.tgz
