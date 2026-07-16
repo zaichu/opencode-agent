@@ -20,15 +20,10 @@ opencode-agent --version
 
 ## CLI usage
 
-JSON is the default, so a parent agent or script can keep the returned IDs and use them later. This PowerShell example runs one task, checks it, sends a follow-up, and closes the worker:
+Start a worker:
 
-```powershell
-$job = opencode-agent spawn --label auth-review "Inspect the authentication code and report any bugs." | ConvertFrom-Json
-opencode-agent status $job.turnId
-$result = opencode-agent wait $job.turnId | ConvertFrom-Json
-$next = opencode-agent followup $job.workerId "Fix the highest-severity bug." | ConvertFrom-Json
-opencode-agent wait $next.turnId
-opencode-agent close $job.workerId
+```text
+opencode-agent spawn --label auth-review "Inspect the authentication code and report any bugs."
 ```
 
 `spawn` returns immediately with IDs such as:
@@ -39,7 +34,14 @@ opencode-agent close $job.workerId
 
 The Worker ID identifies the persistent OpenCode conversation. Each task or follow-up gets its own Turn ID. The same flow works from Codex, Claude Code, CI, or any other caller that can run commands and read JSON.
 
-The commands themselves are the same in PowerShell, Bash, and other shells. Only the shell syntax used to capture JSON changes.
+Use the returned IDs to manage the worker:
+
+```text
+opencode-agent status trn_...
+opencode-agent wait trn_...
+opencode-agent followup wrk_... "Fix the highest-severity bug."
+opencode-agent close wrk_...
+```
 
 ## Using it from Codex, Claude Code, or another harness
 
