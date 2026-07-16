@@ -2,15 +2,11 @@
 
 Use OpenCode as a persistent subagent from any tool that can run a CLI command.
 
-The reason for this project is simple: a strong model is useful as the main orchestrator, but it does not need to handle every repository search, test run, or implementation task itself. `opencode-agent` lets it hand work to an OpenCode session using whichever agent and model you choose, then check the work or send follow-ups later.
-
-OpenCode does the actual coding. This project adds the worker lifecycle around it.
+A strong model can remain the orchestrator while cheaper OpenCode models handle repository searches, tests, reviews, and implementation work. OpenCode does the coding; `opencode-agent` adds durable worker IDs, follow-ups, waiting, interruption, and saved state.
 
 ## Install
 
-You need [Bun](https://bun.sh/) 1.3 or newer and a working [OpenCode](https://opencode.ai/) installation with a configured provider.
-
-From this repository:
+Requires [Bun](https://bun.sh/) 1.3 or newer and a working [OpenCode](https://opencode.ai/) installation.
 
 ```powershell
 bun install
@@ -18,23 +14,21 @@ bun link
 opencode-agent --version
 ```
 
-## CLI usage
+## Basic workflow
 
 Start a worker:
 
 ```text
-opencode-agent spawn --label auth-review "Inspect the authentication code and report any bugs."
+opencode-agent spawn --label auth-review "Inspect the authentication flow and report any bugs."
 ```
 
-`spawn` returns immediately with IDs such as:
+`spawn` returns immediately:
 
 ```json
 {"workerId":"wrk_...","turnId":"trn_...","status":"running","label":"auth-review"}
 ```
 
-The Worker ID identifies the persistent OpenCode conversation. Each task or follow-up gets its own Turn ID. The same flow works from Codex, Claude Code, CI, or any other caller that can run commands and read JSON.
-
-Use the returned IDs to manage the worker:
+Use the Turn ID to inspect or wait for that task. Use the Worker ID to continue or close the persistent conversation.
 
 ```text
 opencode-agent status trn_...
@@ -43,152 +37,91 @@ opencode-agent followup wrk_... "Fix the highest-severity bug."
 opencode-agent close wrk_...
 ```
 
-## Using it from Codex, Claude Code, or another harness
-
-There is no special plugin protocol. A coding harness uses its terminal tool to run `opencode-agent`, reads the JSON response, and keeps the returned IDs in its own task context.
-
-The integration contract is:
-
-1. Keep the registry scope consistent: run from the project root, pass the same `--project <path>`, or use `--scope global` on every command.
-2. Call `spawn` and save both `workerId` and `turnId` from stdout.
-3. Use `status <turn-id>` for a nonblocking check, or `wait <turn-id>` when blocking is acceptable.
-4. Use `followup <worker-id>` to continue that worker's OpenCode conversation. Save the new Turn ID it returns.
-5. Use `interrupt <worker-id>` to stop only the active turn, or `close <worker-id>` when the worker is finished.
-
-Do not use labels as identifiers. Two workers may have the same label.
-
-For reliable automation, keep the default JSON output. A successful command writes one JSON object to stdout. A failure writes a JSON error to stderr and exits nonzero. `--text` is intended for humans, not harness integrations.
-
-Long or multiline tasks are safer through `--file` or `--stdin` than through shell quoting:
-
-```text
-opencode-agent spawn --project <project-root> --dir <worker-directory> --stdin
-```
-
-The harness supplies the task on stdin and receives:
-
-```json
-{"workerId":"wrk_...","turnId":"trn_...","status":"running"}
-```
-
-A typical instruction to a main coding agent can be as simple as:
-
-```text
-Use opencode-agent to delegate this repository review to an OpenCode worker.
-Keep the Worker and Turn IDs, wait for its report, send a follow-up if needed,
-then close the worker.
-```
-
-To run several subagents, call `spawn` several times, keep each receipt separately, and wait on the Turn IDs you need. Each worker has its own OpenCode session; follow-ups must go to the matching Worker ID.
-
-`wait` has no adapter timeout, but the harness's terminal tool may have one. For very long tasks, poll with `status` and call `wait` only when the turn is near completion. Stopping a local `wait` command does not stop the worker.
+Labels are display names and may be duplicated. Always manage workers by ID.
 
 ## Commands
 
-| Command | What it does |
+| Command | Result |
 | --- | --- |
-| `spawn <task>` | Starts a worker and returns a Worker ID and Turn ID |
-| `list` | Lists workers in the current registry |
-| `status <id>` | Checks a Worker ID or Turn ID without blocking |
-| `followup <worker-id> <message>` | Sends another message to an existing worker |
-| `wait <turn-id>` | Waits until a turn completes, fails, or is interrupted |
+| `spawn <task>` | Starts a worker and returns its Worker ID and first Turn ID |
+| `list` | Lists workers in the selected registry |
+| `status <id>` | Reads a Worker or Turn without blocking |
+| `followup <worker-id> <message>` | Queues another turn in the same conversation |
+| `wait <turn-id>` | Blocks until the turn completes, fails, or is interrupted |
 | `interrupt <worker-id>` | Stops the active turn but keeps the worker open |
 | `close <worker-id>` | Stops the worker, cancels its queue, and closes its OpenCode session |
 
-There is no separate `result` command. Once a turn finishes, `status` includes its result. Use `wait` when you want to block until that result is ready.
+There is no separate `result` command. A completed turn's text is returned by `status` and `wait`.
 
-Run `opencode-agent --help` to see the available options.
+## Options
 
-## Worker options
-
-The normal command needs only a task:
-
-```powershell
-opencode-agent spawn "Implement the requested change and run its tests."
+```text
+--dir <path>             Worker directory; defaults to the current directory
+--label <label>          Optional display label
+--agent <agent>          Optional OpenCode agent override
+--model <provider/model> Optional OpenCode model override
+--scope project|global   Registry scope; defaults to project
+--project <path>         Select another project's registry
+--file <path>            Read the task or follow-up from a file
+--stdin                  Read the task or follow-up from stdin
+--text                   Print only human-readable result text
 ```
 
-OpenCode uses its configured default agent and model. Only provide overrides when a task needs them:
+Without `--agent` or `--model`, OpenCode uses its configured defaults. A primary OpenCode agent can delegate internally when instructed:
 
-```powershell
-opencode-agent spawn `
-  --dir "C:\workspace\project" `
-  --agent build `
-  --label implementation `
-  "Implement the requested change and run its tests."
-```
-
-- `--dir` is the worker's directory. It defaults to the current directory.
-- `--agent` optionally selects an OpenCode agent such as `build`, `plan`, or a configured custom agent.
-- `--model` optionally overrides the configured model using OpenCode's `provider/model` format.
-- `--label` is only a display name. Labels do not need to be unique.
-
-Follow-ups use the worker's agent and model unless you override them again.
-
-OpenCode primary agents may delegate parts of the task to subagents such as `explore` or `general`. You can request that in the task:
-
-```powershell
+```text
 opencode-agent spawn --agent build "Use the explore subagent to map the authentication flow, then report back."
 ```
 
-Available agents and their permissions come from the installed OpenCode version and its global or project configuration.
+Available agents and permissions come from the installed OpenCode version and its global or project configuration.
 
-For longer prompts, use a file or stdin:
+For long prompts, avoid shell quoting:
 
 ```powershell
 opencode-agent spawn --file .\task.md
 Get-Content .\task.md | opencode-agent spawn --stdin
 ```
 
-Exactly one prompt source is allowed per `spawn` or `followup` command.
+Exactly one prompt source is allowed.
 
-## Long-running and parallel workers
+## Coding harnesses
 
-There is no adapter timeout. After `spawn` returns, the local daemon keeps the turn running. You can close the terminal and come back later with `status`, `wait`, or `list`.
+Codex, Claude Code, CI, and custom orchestrators use the same CLI contract:
 
-Workers can run at the same time, and the adapter does not impose a fixed worker limit. Turns within one worker run one at a time in the order they were received.
+1. Run `spawn` and retain both returned IDs.
+2. Use `status <turn-id>` for a nonblocking check or `wait <turn-id>` when blocking is safe.
+3. Send follow-ups to the Worker ID and retain each new Turn ID.
+4. Use `interrupt` for the active turn or `close` when the conversation is finished.
 
-Do not let several write-capable workers edit the same checkout concurrently. Use a separate Git worktree for each one when their tasks may overlap.
+Keep registry scope consistent across commands: run from the same Git project, pass the same `--project`, or use `--scope global` each time.
 
-## Server and saved state
-
-You normally do not need to run `opencode serve` yourself. On first use, `opencode-agent` starts its own local daemon. That daemon:
-
-1. Reuses the OpenCode server at `http://127.0.0.1:4096` if it is healthy.
-2. Starts `opencode serve` if the local server is not running.
-3. Keeps accepted work alive after the original CLI command exits.
-
-Worker and turn records are saved in SQLite under your OS user-data directory. They are not written into the repository.
-
-State is project-scoped by default. The nearest Git root determines the registry. You can address another project or use one user-global registry:
-
-```powershell
-opencode-agent list --project "C:\workspace\another-project"
-opencode-agent list --scope global
-```
-
-`--project` selects the registry containing the IDs. `--dir` selects where a worker reads and writes files.
-
-## Output
-
-Every command prints JSON by default. The response leaves out OpenCode reasoning, internal events, session IDs, token details, and monetary cost.
-
-Use `--text` when you only want the final response text:
-
-```powershell
-opencode-agent wait trn_... --text
-```
-
-Errors are JSON too:
+JSON is the default. Successful commands write one JSON value to stdout. Failures write one JSON error to stderr and exit nonzero:
 
 ```json
 {"error":{"code":"WORKER_NOT_FOUND","message":"Worker wrk_... was not found.","retryable":false}}
 ```
 
-## Permissions
+The response omits OpenCode reasoning, internal events, session IDs, token details, and cost.
 
-These workers are non-interactive. When OpenCode asks for permission during an active adapter turn, the adapter approves it. OpenCode questions that require a user response are rejected because the CLI cannot relay them yet.
+## Long-running and parallel work
 
-Only send trusted tasks, and give workers access only to directories they are allowed to change.
+There is no adapter turn timeout. The local daemon keeps accepted work running after the original CLI process exits. A harness terminal may still have its own timeout; for long tasks, poll with `status` and call `wait` near completion.
+
+Workers run concurrently without a fixed adapter limit. Turns within one worker remain FIFO.
+
+Do not let write-capable workers edit the same checkout concurrently. Give overlapping workers separate Git worktrees.
+
+## Server, state, and permissions
+
+You normally do not need to start `opencode serve`. On first use, the adapter daemon:
+
+- reuses a healthy OpenCode server at `http://127.0.0.1:4096`;
+- starts `opencode serve` when that local server is absent;
+- stores workers and turns in SQLite under the OS user-data directory.
+
+State is project-scoped by default using the nearest Git root. `--project` selects another project registry; `--dir` controls where the worker reads and writes.
+
+Workers are non-interactive. OpenCode permission requests for active adapter turns are approved. Questions requiring a user answer are rejected because the CLI cannot relay them yet. Only delegate trusted tasks and directories.
 
 ## Configuration
 
@@ -203,18 +136,10 @@ Only send trusted tasks, and give workers access only to directories they are al
 ## Development
 
 ```powershell
-bun run typecheck
-bun test
-bun run test:terminal
-```
-
-Or run every deterministic check:
-
-```powershell
 bun run test:all
 ```
 
-The terminal suite uses a fake OpenCode server and does not call a model. The live test uses a real provider and may cost money:
+The deterministic terminal suite uses the shared fake OpenCode adapter. The live test invokes a configured provider and may cost money:
 
 ```powershell
 bun run test:live

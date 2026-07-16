@@ -1,15 +1,21 @@
 #!/usr/bin/env bun
 
 import { runCli } from "./cli.ts";
-import { loadConfig } from "./config.ts";
+import { ConfigError, loadConfig } from "./config.ts";
 import { runDaemon } from "./daemon.ts";
+import type { ErrorBody } from "./protocol.ts";
+import { RuntimeError } from "./runtime.ts";
 
-const config = loadConfig();
-
-if (Bun.argv[2] === "__daemon") {
-  try {
+const daemonMode = Bun.argv[2] === "__daemon";
+try {
+  const config = loadConfig();
+  if (daemonMode) {
     await runDaemon(config);
-  } catch (error) {
+  } else {
+    await runCli(Bun.argv.slice(2), config);
+  }
+} catch (error) {
+  if (daemonMode) {
     console.error(
       JSON.stringify({
         level: "error",
@@ -18,7 +24,29 @@ if (Bun.argv[2] === "__daemon") {
       }),
     );
     process.exitCode = 1;
+  } else {
+    const body = errorBody(error);
+    console.error(JSON.stringify({ error: body }));
+    process.exitCode = exitCode(body.code);
   }
-} else {
-  await runCli(Bun.argv.slice(2), config);
+}
+
+function errorBody(error: unknown): ErrorBody {
+  if (error instanceof RuntimeError) return error.toJSON();
+  if (error instanceof ConfigError) {
+    return { code: error.code, message: error.message, retryable: error.retryable };
+  }
+  return {
+    code: "INTERNAL_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+    retryable: false,
+  };
+}
+
+function exitCode(code: string): number {
+  if (code === "INVALID_USAGE" || code === "INVALID_DIRECTORY" || code === "INVALID_ID" || code === "INVALID_CONFIG") return 2;
+  if (code === "WORKER_NOT_FOUND" || code === "WORKER_CLOSED") return 3;
+  if (code === "TURN_NOT_FOUND") return 4;
+  if (code === "DAEMON_UNAVAILABLE" || code === "DAEMON_VERSION_MISMATCH") return 7;
+  return 5;
 }

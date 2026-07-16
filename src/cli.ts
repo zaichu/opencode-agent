@@ -1,5 +1,6 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { parseArgs as parseNodeArgs } from "node:util";
 import type { AdapterConfig } from "./config.ts";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION } from "./config.ts";
 import type { CommandRequest, ErrorBody, Scope } from "./protocol.ts";
@@ -13,31 +14,25 @@ interface ParsedArgs {
 }
 
 export async function runCli(argv: string[], config: AdapterConfig): Promise<void> {
-  try {
-    const parsed = parseArgs(argv);
-    const command = parsed.positionals.shift();
-    if (command === "version" || parsed.flags.has("version")) {
-      console.log(VERSION);
-      return;
-    }
-    if (!command || parsed.flags.has("help")) {
-      console.log(help());
-      return;
-    }
-
-    const scope = await resolveScope({
-      scope: parsed.options.get("scope"),
-      project: parsed.options.get("project"),
-      cwd: process.cwd(),
-    });
-    const request = await makeRequest(command, parsed, scope);
-    const result = await callDaemon(request, config);
-    printResult(result, parsed.flags.has("text"));
-  } catch (error) {
-    const body = errorBody(error);
-    console.error(JSON.stringify({ error: body }));
-    process.exitCode = exitCode(body.code);
+  const parsed = parseArgs(argv);
+  const command = parsed.positionals.shift();
+  if (command === "version" || parsed.flags.has("version")) {
+    console.log(VERSION);
+    return;
   }
+  if (!command || parsed.flags.has("help")) {
+    console.log(help());
+    return;
+  }
+
+  const scope = await resolveScope({
+    scope: parsed.options.get("scope"),
+    project: parsed.options.get("project"),
+    cwd: process.cwd(),
+  });
+  const request = await makeRequest(command, parsed, scope);
+  const result = await callDaemon(request, config);
+  printResult(result, parsed.flags.has("text"));
 }
 
 async function makeRequest(
@@ -52,13 +47,13 @@ async function makeRequest(
       return {
         scope,
         operation: "spawn",
-        input: compact({
+        input: {
           task: await readPrompt(parsed),
           directory: resolve(parsed.options.get("dir") ?? process.cwd()),
           label: parsed.options.get("label"),
           agent: parsed.options.get("agent"),
           model: parsed.options.get("model"),
-        }),
+        },
       };
     case "list":
       requirePositionals(parsed, 0, "list");
@@ -71,12 +66,12 @@ async function makeRequest(
       return {
         scope,
         operation: "followup",
-        input: compact({
+        input: {
           workerId,
           message: await readPrompt(parsed),
           agent: parsed.options.get("agent"),
           model: parsed.options.get("model"),
-        }),
+        },
       };
     }
     case "wait":
@@ -175,36 +170,28 @@ function assertProtocol(response: Response): void {
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  const options = new Map<string, string>();
-  const flags = new Set<string>();
-  const positionals: string[] = [];
-  const valueOptions = new Set(["dir", "label", "agent", "model", "file", "scope", "project"]);
-  const flagOptions = new Set(["stdin", "text", "help", "version"]);
-
-  for (let index = 0; index < argv.length; index++) {
-    const token = argv[index]!;
-    if (token === "--") {
-      positionals.push(...argv.slice(index + 1));
-      break;
+  try {
+    const parsed = parseNodeArgs({
+      args: argv,
+      allowPositionals: true,
+      strict: true,
+      options: {
+        dir: { type: "string" }, label: { type: "string" }, agent: { type: "string" },
+        model: { type: "string" }, file: { type: "string" }, scope: { type: "string" },
+        project: { type: "string" }, stdin: { type: "boolean" }, text: { type: "boolean" },
+        help: { type: "boolean" }, version: { type: "boolean" },
+      },
+    });
+    const options = new Map<string, string>();
+    const flags = new Set<string>();
+    for (const [name, value] of Object.entries(parsed.values)) {
+      if (typeof value === "string") options.set(name, value);
+      else if (value === true) flags.add(name);
     }
-    if (!token.startsWith("--")) {
-      positionals.push(token);
-      continue;
-    }
-
-    const name = token.slice(2);
-    if (valueOptions.has(name)) {
-      const value = argv[++index];
-      if (!value || value.startsWith("--")) throw usage(`--${name} requires a value.`);
-      if (options.has(name)) throw usage(`--${name} can only be supplied once.`);
-      options.set(name, value);
-    } else if (flagOptions.has(name)) {
-      flags.add(name);
-    } else {
-      throw usage(`Unknown option --${name}.`);
-    }
+    return { options, flags, positionals: parsed.positionals };
+  } catch (error) {
+    throw usage(error instanceof Error ? error.message : String(error));
   }
-  return { options, flags, positionals };
 }
 
 function rejectUnusedOptions(parsed: ParsedArgs, command: string): void {
@@ -268,29 +255,8 @@ function printResult(value: unknown, text: boolean): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
-function errorBody(error: unknown): ErrorBody {
-  if (error instanceof RuntimeError) return error.toJSON();
-  return {
-    code: "INTERNAL_ERROR",
-    message: error instanceof Error ? error.message : String(error),
-    retryable: false,
-  };
-}
-
 function usage(message: string): RuntimeError {
   return new RuntimeError("INVALID_USAGE", message);
-}
-
-function exitCode(code: string): number {
-  if (code === "INVALID_USAGE" || code === "INVALID_DIRECTORY" || code === "INVALID_ID") return 2;
-  if (code === "WORKER_NOT_FOUND" || code === "WORKER_CLOSED") return 3;
-  if (code === "TURN_NOT_FOUND") return 4;
-  if (code === "DAEMON_UNAVAILABLE" || code === "DAEMON_VERSION_MISMATCH") return 7;
-  return 5;
-}
-
-function compact<T extends Record<string, unknown>>(value: T): T {
-  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
 
 function help(): string {

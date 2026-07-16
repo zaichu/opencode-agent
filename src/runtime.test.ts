@@ -104,6 +104,7 @@ class FakeOpenCode implements OpenCodePort {
   private nextSession = 0;
   private active = 0;
   readonly started: string[] = [];
+  private readonly attempts = new Map<string, number>();
   maxActive = 0;
 
   constructor(private readonly delay = 5) {}
@@ -112,7 +113,7 @@ class FakeOpenCode implements OpenCodePort {
     return `session-${++this.nextSession}`;
   }
 
-  async runTurn(
+  async executeTurn(
     _sessionId: string,
     _directory: string,
     _messageId: string,
@@ -120,26 +121,17 @@ class FakeOpenCode implements OpenCodePort {
     signal: AbortSignal,
   ): Promise<string> {
     expect(_messageId).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    const attempt = (this.attempts.get(_messageId) ?? 0) + 1;
+    this.attempts.set(_messageId, attempt);
     this.started.push(input.message);
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
     try {
       await sleep(input.message === "slow task" ? 1_000 : this.delay, signal);
-      return `done: ${input.message}`;
+      return attempt > 1 ? "recovered" : `done: ${input.message}`;
     } finally {
       this.active--;
     }
-  }
-
-  async recoverTurn(
-    sessionId: string,
-    _directory: string,
-    messageId: string,
-    _input: { message: string },
-    signal: AbortSignal,
-  ): Promise<string> {
-    await sleep(5, signal);
-    return "recovered";
   }
 
   async abort(): Promise<void> {}

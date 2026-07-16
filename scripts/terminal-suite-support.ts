@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { startFakeOpenCode } from "../test/fake-opencode.ts";
 
 export interface TerminalFixture extends AsyncDisposable {
   json(args: string[]): Promise<Record<string, any>>;
@@ -11,14 +12,14 @@ export async function createTerminalFixture(executable: string): Promise<Termina
   const root = await mkdtemp(join(tmpdir(), "opencode-agent-terminal-"));
   await mkdir(join(root, ".git"));
   const dataRoot = join(root, "adapter-state");
-  const openCode = fakeOpenCode();
+  const openCode = startFakeOpenCode();
   return createHostedTerminalFixture({
     executable,
     cwd: root,
     dataRoot,
-    openCodeUrl: `http://127.0.0.1:${openCode.port}`,
+    openCodeUrl: openCode.url,
     async dispose() {
-      openCode.stop(true);
+      openCode.stop();
       await removeTree(root);
     },
   });
@@ -119,157 +120,6 @@ interface CommandResult {
   exitCode: number;
 }
 
-function fakeOpenCode(): ReturnType<typeof Bun.serve> {
-  let nextSession = 0;
-  let nextAssistant = 0;
-  const encoder = new TextEncoder();
-  const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
-  const sessions = new Map<string, FakeSession>();
-
-  const emit = (payload: Record<string, unknown>): void => {
-    const data = encoder.encode(`data: ${JSON.stringify({ payload })}\n\n`);
-    for (const stream of streams) stream.enqueue(data);
-  };
-
-  return Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/global/health") {
-        return Response.json({ healthy: true, version: "terminal-test" });
-      }
-      if (request.method === "GET" && url.pathname === "/global/event") {
-        let controller: ReadableStreamDefaultController<Uint8Array>;
-        return new Response(
-          new ReadableStream<Uint8Array>({
-            start(value) {
-              controller = value;
-              streams.add(value);
-              value.enqueue(
-                encoder.encode('data: {"payload":{"type":"server.connected","properties":{}}}\n\n'),
-              );
-            },
-            cancel() {
-              streams.delete(controller);
-            },
-          }),
-          { headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      if (request.method === "POST" && url.pathname === "/session") {
-        const id = `session-terminal-${++nextSession}`;
-        const directory = url.searchParams.get("directory") ?? "";
-        sessions.set(id, { directory, status: "idle", messages: [] });
-        return Response.json({ id, directory });
-      }
-      if (request.method === "GET" && (url.pathname === "/permission" || url.pathname === "/question")) {
-        return Response.json([]);
-      }
-      if (request.method === "GET" && url.pathname === "/session/status") {
-        return Response.json(
-          Object.fromEntries([...sessions].map(([id, session]) => [id, { type: session.status }])),
-        );
-      }
-
-      const prompt = url.pathname.match(/^\/session\/([^/]+)\/prompt_async$/);
-      if (request.method === "POST" && prompt) {
-        const sessionId = decodeURIComponent(prompt[1]!);
-        const session = sessions.get(sessionId);
-        if (!session) return new Response("not found", { status: 404 });
-        if (url.searchParams.get("directory") !== session.directory) {
-          return new Response("wrong directory", { status: 400 });
-        }
-        const body = (await request.json()) as {
-          messageID: string;
-          parts?: Array<{ type?: string; text?: string }>;
-        };
-        const text = body.parts?.find((part) => part.type === "text")?.text ?? "";
-        void completePrompt(sessionId, session, body.messageID, text);
-        return new Response(null, { status: 204 });
-      }
-
-      const message = url.pathname.match(/^\/session\/([^/]+)\/message\/([^/]+)$/);
-      if (request.method === "GET" && message) {
-        const session = sessions.get(decodeURIComponent(message[1]!));
-        const found = session?.messages.find((entry) => entry.info.id === decodeURIComponent(message[2]!));
-        return found ? Response.json(found) : new Response("not found", { status: 404 });
-      }
-      const messages = url.pathname.match(/^\/session\/([^/]+)\/message$/);
-      if (request.method === "GET" && messages) {
-        return Response.json(sessions.get(decodeURIComponent(messages[1]!))?.messages ?? []);
-      }
-      if (request.method === "POST" && /\/session\/[^/]+\/abort$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.split("/")[2]!);
-        const session = sessions.get(id);
-        if (session) session.status = "idle";
-        emit({ type: "session.idle", properties: { sessionID: id } });
-        return Response.json(true);
-      }
-      if (request.method === "DELETE" && /\/session\/[^/]+$/.test(url.pathname)) {
-        sessions.delete(decodeURIComponent(url.pathname.slice("/session/".length)));
-        return Response.json(true);
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
-
-  async function completePrompt(
-    sessionId: string,
-    session: FakeSession,
-    userMessageId: string,
-    prompt: string,
-  ): Promise<void> {
-    // OpenCode accepts prompt_async before the prompt becomes observable.
-    await Bun.sleep(15);
-    session.status = "busy";
-    const user = {
-      info: { id: userMessageId, sessionID: sessionId, role: "user", time: { created: Date.now() } },
-      parts: [{ type: "text", text: prompt }],
-    };
-    session.messages.push(user);
-    emit({ type: "message.updated", properties: { info: user.info } });
-    if (prompt === "WAIT-FOR-INTERRUPT") return;
-
-    const remembered = session.messages
-      .flatMap((entry) => entry.parts)
-      .map((part) => part.text ?? "")
-      .join("\n")
-      .match(/BLUE-\d+/)?.[0];
-    const reply = prompt.includes("What code did I ask you to remember")
-      ? (remembered ?? "NOT-FOUND")
-      : prompt.includes("Remember BLUE-4821")
-        ? "READY"
-        : `reply: ${prompt}`;
-    const assistant = {
-      info: {
-        id: `assistant-terminal-${++nextAssistant}`,
-        sessionID: sessionId,
-        role: "assistant",
-        parentID: userMessageId,
-        time: { created: Date.now() } as { created: number; completed?: number },
-      },
-      parts: [{ type: "text", text: reply }],
-    };
-    session.messages.push(assistant);
-    emit({ type: "message.updated", properties: { info: assistant.info } });
-    await Bun.sleep(15);
-    assistant.info.time.completed = Date.now();
-    session.status = "idle";
-    emit({ type: "message.updated", properties: { info: assistant.info } });
-    emit({ type: "session.idle", properties: { sessionID: sessionId } });
-  }
-}
-
-interface FakeSession {
-  directory: string;
-  status: "idle" | "busy";
-  messages: Array<{
-    info: Record<string, any>;
-    parts: Array<{ type?: string; text?: string }>;
-  }>;
-}
-
 function availablePort(): number {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const port = server.port;
@@ -313,7 +163,6 @@ async function stopDaemon(dataRoot: string): Promise<void> {
     await Bun.sleep(20);
   }
 }
-
 async function removeTree(path: string): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt++) {
     try {

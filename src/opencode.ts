@@ -1,13 +1,6 @@
 export interface OpenCodePort {
   createSession(input: { directory: string; label?: string }): Promise<string>;
-  runTurn(
-    sessionId: string,
-    directory: string,
-    messageId: string,
-    input: { message: string; agent?: string; model?: string },
-    signal: AbortSignal,
-  ): Promise<string>;
-  recoverTurn(
+  executeTurn(
     sessionId: string,
     directory: string,
     messageId: string,
@@ -44,7 +37,7 @@ interface PendingTurn {
   abortListener(): void;
 }
 
-export class OpenCodeFailure extends Error {
+class OpenCodeFailure extends Error {
   constructor(
     readonly code: string,
     message: string,
@@ -55,7 +48,7 @@ export class OpenCodeFailure extends Error {
   }
 }
 
-export class OpenCodeClient {
+class OpenCodeClient {
   constructor(private readonly baseUrl = "http://127.0.0.1:4096") {}
 
   async health(): Promise<{ healthy: true; version?: string } | null> {
@@ -107,9 +100,15 @@ export class OpenCodeClient {
 
   async sessionStatus(sessionId: string, directory: string): Promise<"busy" | "idle" | "retry"> {
     const response = await this.request(this.directoryUrl("/session/status", directory));
-    const statuses = (await response.json()) as Record<string, { type?: unknown }>;
-    const status = statuses[sessionId]?.type;
-    return status === "busy" || status === "retry" ? status : "idle";
+    const statuses = await jsonObject(response, "session status");
+    const entry = statuses[sessionId];
+    if (entry === undefined) return "idle";
+    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid session status.");
+    const status = (entry as { type?: unknown }).type;
+    if (status !== "busy" && status !== "idle" && status !== "retry") {
+      invalidResponse("OpenCode returned an invalid session status.");
+    }
+    return status;
   }
 
   async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
@@ -140,7 +139,7 @@ export class OpenCodeClient {
 
   async pendingPermissions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
     const response = await this.request(this.directoryUrl("/permission", directory));
-    return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
+    return requestList(await response.json(), "permission");
   }
 
   async approvePermission(requestId: string, directory: string): Promise<void> {
@@ -153,7 +152,7 @@ export class OpenCodeClient {
 
   async pendingQuestions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
     const response = await this.request(this.directoryUrl("/question", directory));
-    return (await response.json()) as Array<{ id?: string; sessionID?: string }>;
+    return requestList(await response.json(), "question");
   }
 
   async rejectQuestion(requestId: string, directory: string): Promise<void> {
@@ -214,7 +213,7 @@ export class OpenCodeClient {
     const response = await this.request(
       this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
     );
-    return (await response.json()) as MessageEnvelope[];
+    return messageList(await response.json());
   }
 }
 
@@ -240,26 +239,7 @@ export class ManagedOpenCode implements OpenCodePort {
     return this.client.createSession(input);
   }
 
-  async runTurn(
-    sessionId: string,
-    directory: string,
-    messageId: string,
-    input: { message: string; agent?: string; model?: string },
-    signal: AbortSignal,
-  ): Promise<string> {
-    await this.ensureRunning();
-    const pending = this.watch(sessionId, directory, messageId, signal, false);
-    try {
-      await this.client.promptAsync(sessionId, directory, messageId, input);
-      await this.refresh(pending);
-      return await pending.promise;
-    } catch (error) {
-      this.rejectPending(pending, error);
-      throw error;
-    }
-  }
-
-  async recoverTurn(
+  async executeTurn(
     sessionId: string,
     directory: string,
     messageId: string,
@@ -268,19 +248,18 @@ export class ManagedOpenCode implements OpenCodePort {
   ): Promise<string> {
     await this.ensureRunning();
     const existing = await this.client.findAssistant(sessionId, directory, messageId);
-    if (existing && isComplete(existing)) return resultText(existing);
-    if (
-      !existing &&
-      !(await this.client.hasUserMessage(sessionId, directory, messageId)) &&
-      (await this.client.sessionStatus(sessionId, directory)) === "idle"
-    ) {
-      return this.runTurn(sessionId, directory, messageId, input, signal);
-    }
-
-    const pending = this.watch(sessionId, directory, messageId, signal, true);
+    if (existing && isTerminalMessage(existing.info)) return resultText(existing);
+    const persisted = Boolean(existing) || (await this.client.hasUserMessage(sessionId, directory, messageId));
+    const pending = this.watch(sessionId, directory, messageId, signal, persisted);
     if (existing) pending.observed = true;
-    await this.refresh(pending);
-    return pending.promise;
+    try {
+      if (!persisted) await this.client.promptAsync(sessionId, directory, messageId, input);
+      await this.refresh(pending);
+      return await pending.promise;
+    } catch (error) {
+      this.rejectPending(pending, error);
+      throw error;
+    }
   }
 
   async abort(sessionId: string, directory: string): Promise<void> {
@@ -543,12 +522,7 @@ export class ManagedOpenCode implements OpenCodePort {
         false,
       );
     }
-    let resolve!: (value: string) => void;
-    let reject!: (error: unknown) => void;
-    const promise = new Promise<string>((done, fail) => {
-      resolve = done;
-      reject = fail;
-    });
+    const { promise, resolve, reject } = Promise.withResolvers<string>();
     const pending: PendingTurn = {
       sessionId,
       directory,
@@ -692,10 +666,6 @@ function resultText(message: MessageEnvelope): string {
   return result;
 }
 
-function isComplete(message: MessageEnvelope): boolean {
-  return isTerminalMessage(message.info);
-}
-
 function isTerminalMessage(info: {
   error?: unknown;
   finish?: unknown;
@@ -742,4 +712,67 @@ function isLocalHost(hostname: string): boolean {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function jsonObject(response: Response, name: string): Promise<Record<string, unknown>> {
+  const value = await response.json();
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    invalidResponse(`OpenCode returned an invalid ${name} response.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requestList(value: unknown, name: string): Array<{ id?: string; sessionID?: string }> {
+  if (!Array.isArray(value)) invalidResponse(`OpenCode returned an invalid ${name} list.`);
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") invalidResponse(`OpenCode returned an invalid ${name} request.`);
+    const request = entry as { id?: unknown; sessionID?: unknown };
+    if (request.id !== undefined && typeof request.id !== "string") {
+      invalidResponse(`OpenCode returned an invalid ${name} request ID.`);
+    }
+    if (request.sessionID !== undefined && typeof request.sessionID !== "string") {
+      invalidResponse(`OpenCode returned an invalid ${name} session ID.`);
+    }
+    return {
+      id: typeof request.id === "string" ? request.id : undefined,
+      sessionID: typeof request.sessionID === "string" ? request.sessionID : undefined,
+    };
+  });
+}
+
+function messageList(value: unknown): MessageEnvelope[] {
+  if (!Array.isArray(value)) invalidResponse("OpenCode returned an invalid message list.");
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid message.");
+    const message = entry as { info?: unknown; parts?: unknown };
+    if (!message.info || typeof message.info !== "object" || !Array.isArray(message.parts)) {
+      invalidResponse("OpenCode returned an invalid message envelope.");
+    }
+    const info = message.info as Record<string, unknown>;
+    if (typeof info.id !== "string" || (info.role !== "user" && info.role !== "assistant")) {
+      invalidResponse("OpenCode returned invalid message information.");
+    }
+    if (info.parentID !== undefined && typeof info.parentID !== "string") {
+      invalidResponse("OpenCode returned an invalid parent message ID.");
+    }
+    const parts = message.parts.map((part) => {
+      if (!part || typeof part !== "object") invalidResponse("OpenCode returned an invalid message part.");
+      const value = part as { type?: unknown; text?: unknown };
+      if (value.type !== undefined && typeof value.type !== "string") {
+        invalidResponse("OpenCode returned an invalid message part type.");
+      }
+      if (value.text !== undefined && typeof value.text !== "string") {
+        invalidResponse("OpenCode returned invalid message text.");
+      }
+      return {
+        type: typeof value.type === "string" ? value.type : undefined,
+        text: typeof value.text === "string" ? value.text : undefined,
+      };
+    });
+    return { info: info as unknown as MessageEnvelope["info"], parts };
+  });
+}
+
+function invalidResponse(message: string): never {
+  throw new OpenCodeFailure("INVALID_OPENCODE_RESPONSE", message, false);
 }

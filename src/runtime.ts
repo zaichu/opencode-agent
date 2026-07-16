@@ -4,7 +4,7 @@ import { Registry, RegistryError, type TurnRecord, type WorkerRecord } from "./r
 
 export type WorkerId = `wrk_${string}`;
 export type TurnId = `trn_${string}`;
-export type WorkerState = "starting" | "running" | "idle" | "failed" | "closed";
+export type WorkerState = "running" | "idle" | "closed";
 export type TurnState = "queued" | "running" | "completed" | "interrupted" | "failed";
 
 export interface SpawnRequest {
@@ -114,10 +114,10 @@ export function createWorkerRuntime(input: {
   let disposing = false;
   let disposePromise: Promise<void> | undefined;
 
-  const execute = async (turn: TurnRecord, worker: WorkerRecord, recovering: boolean): Promise<void> => {
+  const execute = async (turn: TurnRecord, worker: WorkerRecord): Promise<void> => {
     const controller = new AbortController();
     controllers.set(turn.id, controller);
-    let changed = false;
+    let next: TurnRecord | null = null;
     try {
       if (!turn.openCodeMessageId) {
         throw new RuntimeError(
@@ -126,61 +126,32 @@ export function createWorkerRuntime(input: {
           true,
         );
       }
-      const text = recovering
-        ? await input.client.recoverTurn(
-            worker.sessionId,
-            worker.directory,
-            turn.openCodeMessageId,
-            {
-              message: turn.message,
-              agent: turn.agent ?? worker.agent,
-              model: turn.model ?? worker.model,
-            },
-            controller.signal,
-          )
-        : await input.client.runTurn(
-            worker.sessionId,
-            worker.directory,
-            turn.openCodeMessageId,
-            {
-              message: turn.message,
-              agent: turn.agent ?? worker.agent,
-              model: turn.model ?? worker.model,
-            },
-            controller.signal,
-          );
-      if (!disposing) changed = registry.finishTurn(turn.id, text);
+      const text = await input.client.executeTurn(
+        worker.sessionId,
+        worker.directory,
+        turn.openCodeMessageId,
+        {
+          message: turn.message,
+          agent: turn.agent ?? worker.agent,
+          model: turn.model ?? worker.model,
+        },
+        controller.signal,
+      );
+      if (!disposing) next = registry.finishTurn(turn.id, text);
     } catch (error) {
-      if (!disposing) changed = registry.failTurn(turn.id, runtimeErrorBody(error));
+      if (!disposing) next = registry.failTurn(turn.id, runtimeErrorBody(error));
     } finally {
       controllers.delete(turn.id);
       signal(turn.id);
-      if (changed && !disposing) startNext(worker.id);
+      if (next && !disposing) launch(next, requiredWorker(worker.id));
     }
   };
 
-  const launch = (turn: TurnRecord, worker: WorkerRecord, recovering: boolean): void => {
+  const launch = (turn: TurnRecord, worker: WorkerRecord): void => {
     if (disposing) return;
-    const job = execute(turn, worker, recovering);
+    const job = execute(turn, worker);
     jobs.add(job);
     void job.finally(() => jobs.delete(job));
-  };
-
-  const startNext = (workerId: WorkerId): void => {
-    if (disposing) return;
-    const turn = registry.startNext(workerId);
-    if (!turn) return;
-    const worker = registry.getWorker(workerId);
-    if (!worker) {
-      registry.failTurn(turn.id, {
-        code: "WORKER_NOT_FOUND",
-        message: `Worker ${workerId} disappeared while starting a queued turn.`,
-        retryable: false,
-      });
-      signal(turn.id);
-      return;
-    }
-    launch(turn, worker, false);
   };
 
   const recover = async (): Promise<void> => {
@@ -194,9 +165,8 @@ export function createWorkerRuntime(input: {
         });
         continue;
       }
-      launch(turn, worker, true);
+      launch(turn, worker);
     }
-    for (const workerId of registry.workersReadyForQueuedTurns()) startNext(workerId);
   };
 
   const ready = recover();
@@ -244,8 +214,8 @@ export function createWorkerRuntime(input: {
         await Promise.allSettled([input.client.close(sessionId, directory)]);
         throw error;
       }
-      launch(turn, worker, false);
-      return compact({ workerId, turnId, status: "running" as const, label: request.label });
+      launch(turn, worker);
+      return { workerId, turnId, status: "running" as const, label: request.label };
     },
 
     async list() {
@@ -280,7 +250,7 @@ export function createWorkerRuntime(input: {
       const status = registry.enqueueTurn(turn);
       if (status === "running") {
         const current = requiredWorker(worker.id);
-        launch(turn, current, false);
+        launch(turn, current);
       }
       return { workerId: worker.id, turnId: turn.id, status };
     },
@@ -299,14 +269,15 @@ export function createWorkerRuntime(input: {
     async interrupt(workerId) {
       await ready;
       const worker = requiredWorker(workerId);
-      const interruptedTurnId = registry.interruptActive(workerId) ?? undefined;
-      if (!interruptedTurnId) return workerSnapshot(worker);
+      const transition = registry.interruptActive(workerId);
+      if (!transition) return workerSnapshot(worker);
+      const { interruptedTurnId } = transition;
 
       controllers.get(interruptedTurnId)?.abort();
       signal(interruptedTurnId);
       await Promise.allSettled([input.client.abort(worker.sessionId, worker.directory)]);
-      startNext(workerId);
-      return compact({ ...workerSnapshot(requiredWorker(workerId)), interruptedTurnId });
+      if (transition.next) launch(transition.next, requiredWorker(workerId));
+      return { ...workerSnapshot(requiredWorker(workerId)), interruptedTurnId };
     },
 
     async close(workerId) {
@@ -352,7 +323,7 @@ export function createWorkerRuntime(input: {
   }
 
   function workerSnapshot(worker: WorkerRecord): WorkerSnapshot {
-    return compact({
+    return {
       type: "worker" as const,
       workerId: worker.id,
       status: worker.status,
@@ -360,16 +331,13 @@ export function createWorkerRuntime(input: {
       queuedTurnIds: registry.queuedTurnIds(worker.id),
       directory: worker.directory,
       label: worker.label,
-    });
+    };
   }
 
   function getLatch(turnId: TurnId): TurnLatch {
     let latch = latches.get(turnId);
     if (latch) return latch;
-    let resolve!: () => void;
-    const promise = new Promise<void>((done) => {
-      resolve = done;
-    });
+    const { promise, resolve } = Promise.withResolvers<void>();
     latch = { promise, resolve };
     latches.set(turnId, latch);
     return latch;
@@ -384,14 +352,14 @@ export function createWorkerRuntime(input: {
 }
 
 function turnSnapshot(turn: TurnRecord): TurnSnapshot {
-  return compact({
+  return {
     type: "turn" as const,
     turnId: turn.id,
     workerId: turn.workerId,
     status: turn.status,
     text: turn.text,
     error: turn.error,
-  });
+  };
 }
 
 function makeWorkerId(): WorkerId {
@@ -446,8 +414,4 @@ function runtimeErrorBody(error: unknown): RuntimeErrorBody {
     message: error instanceof Error ? error.message : String(error),
     retryable: false,
   };
-}
-
-function compact<T extends Record<string, unknown>>(value: T): T {
-  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }

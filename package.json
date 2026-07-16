@@ -8,10 +8,8 @@
   },
   "files": [
     "src",
-    "scripts",
-    "docs",
-    "README.md",
-    "CONTEXT.md"
+    "!src/*.test.ts",
+    "README.md"
   ],
   "bin": {
     "opencode-agent": "./src/index.ts"

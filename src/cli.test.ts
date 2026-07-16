@@ -1,20 +1,22 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION } from "./config.ts";
+import { startFakeOpenCode } from "../test/fake-opencode.ts";
 
 test("the CLI controls a project-scoped worker through the daemon", async () => {
   const directory = await mkdtemp(join(tmpdir(), "opencode-agent-cli-"));
   await mkdir(join(directory, ".git"));
-  const openCode = fakeOpenCode();
+  const openCode = startFakeOpenCode();
   const daemonPort = availablePort();
   const entry = join(import.meta.dir, "index.ts");
   const env = {
     ...process.env,
     OPENCODE_AGENT_HOME: join(directory, "adapter-state"),
     OPENCODE_AGENT_PORT: String(daemonPort),
-    OPENCODE_URL: `http://127.0.0.1:${openCode.port}`,
+    OPENCODE_AGENT_MAX_REQUEST_BYTES: "1024",
+    OPENCODE_URL: openCode.url,
   };
   const daemon = Bun.spawn({
     cmd: [process.execPath, entry, "__daemon"],
@@ -37,6 +39,29 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
       body: "{}",
     });
     expect(unauthorized.status).toBe(401);
+
+    const token = (await readFile(join(directory, "adapter-state", "daemon.token"), "utf8")).trim();
+    const oversizedBody = JSON.stringify({
+      scope: { scope: "project", projectRoot: directory },
+      operation: "spawn",
+      input: { task: "é".repeat(600), directory },
+    });
+    const oversized = await fetch(`http://127.0.0.1:${daemonPort}/command`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        [PROTOCOL_HEADER]: String(PROTOCOL_VERSION),
+      },
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(oversizedBody));
+          controller.close();
+        },
+      }),
+      duplex: "half",
+    });
+    expect(oversized.status).toBe(413);
 
     const duplicateDaemon = Bun.spawn({
       cmd: [process.execPath, entry, "__daemon"],
@@ -103,140 +128,28 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
   } finally {
     daemon.kill();
     await daemon.exited;
-    openCode.stop(true);
+    openCode.stop();
     await rm(directory, { recursive: true, force: true });
   }
 }, 15_000);
 
-function fakeOpenCode(): ReturnType<typeof Bun.serve> {
-  let session = 0;
-  let assistant = 0;
-  const encoder = new TextEncoder();
-  const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
-  const sessions = new Map<
-    string,
-    { directory: string; status: "idle" | "busy"; messages: Array<Record<string, any>> }
-  >();
-
-  const emit = (payload: Record<string, unknown>): void => {
-    const data = encoder.encode(`data: ${JSON.stringify({ payload })}\n\n`);
-    for (const stream of streams) stream.enqueue(data);
-  };
-
-  return Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/global/health") {
-        return Response.json({ healthy: true, version: "test" });
-      }
-      if (request.method === "GET" && url.pathname === "/global/event") {
-        let controller: ReadableStreamDefaultController<Uint8Array>;
-        return new Response(
-          new ReadableStream<Uint8Array>({
-            start(value) {
-              controller = value;
-              streams.add(value);
-              value.enqueue(
-                encoder.encode(
-                  `data: ${JSON.stringify({ payload: { type: "server.connected", properties: {} } })}\n\n`,
-                ),
-              );
-            },
-            cancel() {
-              streams.delete(controller);
-            },
-          }),
-          { headers: { "content-type": "text/event-stream" } },
-        );
-      }
-      if (request.method === "POST" && url.pathname === "/session") {
-        const id = `session-${++session}`;
-        const directory = url.searchParams.get("directory") ?? "";
-        sessions.set(id, { directory, status: "idle", messages: [] });
-        return Response.json({ id, directory });
-      }
-      if (request.method === "GET" && url.pathname === "/permission") return Response.json([]);
-      if (request.method === "GET" && url.pathname === "/question") return Response.json([]);
-      if (request.method === "GET" && url.pathname === "/session/status") {
-        if (!url.searchParams.has("directory")) return new Response("directory required", { status: 400 });
-        return Response.json(
-          Object.fromEntries([...sessions].map(([id, value]) => [id, { type: value.status }])),
-        );
-      }
-      const promptMatch = url.pathname.match(/^\/session\/([^/]+)\/prompt_async$/);
-      if (request.method === "POST" && promptMatch) {
-        const sessionId = decodeURIComponent(promptMatch[1]!);
-        const current = sessions.get(sessionId);
-        if (!current) return new Response("not found", { status: 404 });
-        if (url.searchParams.get("directory") !== current.directory) {
-          return new Response("wrong directory", { status: 400 });
-        }
-        const body = (await request.json()) as {
-          messageID?: string;
-          parts?: Array<{ type?: string; text?: string }>;
-        };
-        const prompt = body.parts?.find((part) => part.type === "text")?.text ?? "";
-        const userMessageId = body.messageID ?? `msg-user-${assistant}`;
-        const assistantMessageId = `msg-assistant-${++assistant}`;
-        current.status = "busy";
-        current.messages.push({
-          info: { id: userMessageId, role: "user", time: { created: Date.now() } },
-          parts: body.parts ?? [],
-        });
-        const reply = {
-          info: {
-            id: assistantMessageId,
-            sessionID: sessionId,
-            role: "assistant",
-            parentID: userMessageId,
-            time: { created: Date.now() } as { created: number; completed?: number },
-          },
-          parts: [{ type: "text", text: `reply: ${prompt}` }],
-        };
-        current.messages.push(reply);
-        emit({ type: "message.updated", properties: { info: reply.info } });
-        void (async () => {
-          await Bun.sleep(prompt.includes("8675309") ? 1_000 : 10);
-          reply.info.time.completed = Date.now();
-          current.status = "idle";
-          emit({ type: "message.updated", properties: { info: reply.info } });
-          emit({ type: "session.idle", properties: { sessionID: sessionId } });
-        })();
-        return new Response(null, { status: 204 });
-      }
-      const singleMessage = url.pathname.match(/^\/session\/([^/]+)\/message\/([^/]+)$/);
-      if (request.method === "GET" && singleMessage) {
-        const current = sessions.get(decodeURIComponent(singleMessage[1]!));
-        if (current && url.searchParams.get("directory") !== current.directory) {
-          return new Response("wrong directory", { status: 400 });
-        }
-        const message = current?.messages.find(
-          (entry) => entry.info.id === decodeURIComponent(singleMessage[2]!),
-        );
-        return message ? Response.json(message) : new Response("not found", { status: 404 });
-      }
-      const messages = url.pathname.match(/^\/session\/([^/]+)\/message$/);
-      if (request.method === "GET" && messages) {
-        const current = sessions.get(decodeURIComponent(messages[1]!));
-        if (current && url.searchParams.get("directory") !== current.directory) {
-          return new Response("wrong directory", { status: 400 });
-        }
-        return Response.json(current?.messages ?? []);
-      }
-      if (request.method === "POST" && /\/session\/[^/]+\/abort$/.test(url.pathname)) {
-        return Response.json(true);
-      }
-      if (request.method === "DELETE" && /\/session\/[^/]+$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.slice("/session/".length));
-        sessions.delete(id);
-        return Response.json(true);
-      }
-      return new Response("not found", { status: 404 });
-    },
+test("configuration failures preserve the executable JSON contract", async () => {
+  const child = Bun.spawn({
+    cmd: [process.execPath, join(import.meta.dir, "index.ts"), "version"],
+    env: { ...process.env, OPENCODE_AGENT_PORT: "invalid" },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
   });
-}
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exitCode).toBe(2);
+  expect(stdout).toBe("");
+  expect(JSON.parse(stderr)).toMatchObject({ error: { code: "INVALID_CONFIG", retryable: false } });
+});
 
 function availablePort(): number {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });

@@ -14,6 +14,11 @@ export interface AdapterConfig {
   maxRequestBytes: number;
 }
 
+export class ConfigError extends Error {
+  readonly code = "INVALID_CONFIG";
+  readonly retryable = false;
+}
+
 export function loadConfig(): AdapterConfig {
   const daemonPort = integerSetting("OPENCODE_AGENT_PORT", Bun.env.OPENCODE_AGENT_PORT ?? "47321", 1, 65_535);
   return {
@@ -40,7 +45,7 @@ function defaultDataRoot(): string {
 function integerSetting(name: string, value: string, minimum: number, maximum: number): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
-    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}; received ${value}.`);
+    throw new ConfigError(`${name} must be an integer between ${minimum} and ${maximum}; received ${value}.`);
   }
   return parsed;
 }

@@ -3,14 +3,12 @@ import { join } from "node:path";
 import type { AdapterConfig } from "./config.ts";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION } from "./config.ts";
 import { ManagedOpenCode } from "./opencode.ts";
-import { OPERATIONS, type CommandRequest, type ErrorBody, type Scope } from "./protocol.ts";
+import { ProtocolError, decodeCommand, type DecodedCommand, type ErrorBody, type Scope } from "./protocol.ts";
 import {
   RuntimeError,
   createWorkerRuntime,
   disposeRuntime,
   type HostedWorkerRuntime,
-  type TurnId,
-  type WorkerId,
   type WorkerRuntime,
 } from "./runtime.ts";
 import { daemonToken, stateFileFor } from "./scope.ts";
@@ -60,14 +58,15 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
               `Command body exceeds ${config.maxRequestBytes} bytes.`,
             );
           }
-          const source = await request.text();
-          if (source.length > config.maxRequestBytes) {
+          const bytes = await request.arrayBuffer();
+          if (bytes.byteLength > config.maxRequestBytes) {
             throw new RuntimeError(
               "REQUEST_TOO_LARGE",
               `Command body exceeds ${config.maxRequestBytes} bytes.`,
             );
           }
-          const command = validateCommand(JSON.parse(source));
+          const source = new TextDecoder().decode(bytes);
+          const command = decodeCommand(JSON.parse(source));
           const runtime = await runtimeFor(command.scope);
           return json(await dispatch(runtime, command));
         } catch (error) {
@@ -97,53 +96,23 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
   await new Promise<void>(() => {});
 }
 
-async function dispatch(runtime: WorkerRuntime, command: CommandRequest): Promise<unknown> {
-  const input = command.input;
+async function dispatch(runtime: WorkerRuntime, command: DecodedCommand): Promise<unknown> {
   switch (command.operation) {
     case "spawn":
-      return runtime.spawn({
-        task: stringField(input, "task"),
-        directory: stringField(input, "directory"),
-        label: optionalString(input, "label"),
-        agent: optionalString(input, "agent"),
-        model: optionalString(input, "model"),
-      });
+      return runtime.spawn(command.input);
     case "list":
       return runtime.list();
     case "status":
-      return runtime.status(agentIdField(input, "id"));
+      return runtime.status(command.input.id);
     case "followup":
-      return runtime.followup({
-        workerId: workerIdField(input, "workerId"),
-        message: stringField(input, "message"),
-        agent: optionalString(input, "agent"),
-        model: optionalString(input, "model"),
-      });
+      return runtime.followup(command.input);
     case "wait":
-      return runtime.wait(turnIdField(input, "turnId"));
+      return runtime.wait(command.input.turnId);
     case "interrupt":
-      return runtime.interrupt(workerIdField(input, "workerId"));
+      return runtime.interrupt(command.input.workerId);
     case "close":
-      return runtime.close(workerIdField(input, "workerId"));
+      return runtime.close(command.input.workerId);
   }
-}
-
-function validateCommand(value: unknown): CommandRequest {
-  if (!value || typeof value !== "object") throw new RuntimeError("INVALID_USAGE", "Invalid daemon request.");
-  const request = value as Partial<CommandRequest>;
-  if (!request.scope || !request.operation || !request.input) {
-    throw new RuntimeError("INVALID_USAGE", "Invalid daemon request.");
-  }
-  if (!OPERATIONS.includes(request.operation)) {
-    throw new RuntimeError("INVALID_USAGE", "Invalid daemon operation.");
-  }
-  if (request.scope.scope !== "global" && request.scope.scope !== "project") {
-    throw new RuntimeError("INVALID_USAGE", "Invalid daemon scope.");
-  }
-  if (request.scope.scope === "project" && typeof request.scope.projectRoot !== "string") {
-    throw new RuntimeError("INVALID_USAGE", "Project scope requires a project root.");
-  }
-  return request as CommandRequest;
 }
 
 function json(value: unknown, status = 200): Response {
@@ -153,43 +122,10 @@ function json(value: unknown, status = 200): Response {
   });
 }
 
-function stringField(value: Record<string, unknown>, field: string): string {
-  const result = value[field];
-  if (typeof result !== "string" || !result) {
-    throw new RuntimeError("INVALID_USAGE", `${field} must be a non-empty string.`);
-  }
-  return result;
-}
-
-function optionalString(value: Record<string, unknown>, field: string): string | undefined {
-  const result = value[field];
-  if (result === undefined) return undefined;
-  if (typeof result !== "string" || !result) {
-    throw new RuntimeError("INVALID_USAGE", `${field} must be a non-empty string.`);
-  }
-  return result;
-}
-
-function workerIdField(value: Record<string, unknown>, field: string): WorkerId {
-  const id = stringField(value, field);
-  if (!id.startsWith("wrk_")) throw new RuntimeError("INVALID_ID", `${field} must be a Worker ID.`);
-  return id as WorkerId;
-}
-
-function turnIdField(value: Record<string, unknown>, field: string): TurnId {
-  const id = stringField(value, field);
-  if (!id.startsWith("trn_")) throw new RuntimeError("INVALID_ID", `${field} must be a Turn ID.`);
-  return id as TurnId;
-}
-
-function agentIdField(value: Record<string, unknown>, field: string): WorkerId | TurnId {
-  const id = stringField(value, field);
-  if (id.startsWith("wrk_") || id.startsWith("trn_")) return id as WorkerId | TurnId;
-  throw new RuntimeError("INVALID_ID", `${field} must be a Worker ID or Turn ID.`);
-}
 
 function errorBody(error: unknown): ErrorBody {
   if (error instanceof RuntimeError) return error.toJSON();
+  if (error instanceof ProtocolError) return { code: error.code, message: error.message, retryable: false };
   return {
     code: "INTERNAL_ERROR",
     message: error instanceof Error ? error.message : String(error),
