@@ -9,7 +9,8 @@
   "files": [
     "src",
     "!src/*.test.ts",
-    "README.md"
+    "README.md",
+    "SKILL.md"
   ],
   "bin": {
     "opencode-agent": "./src/index.ts"

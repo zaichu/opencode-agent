@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import type { OpenCodePort } from "./opencode.ts";
 import { Registry, RegistryError, type TurnRecord, type WorkerRecord } from "./registry.ts";
+import { WorktreeError, type WorktreeInfo, type WorktreePort } from "./worktree.ts";
 
 export type WorkerId = `wrk_${string}`;
 export type TurnId = `trn_${string}`;
@@ -9,7 +10,8 @@ export type TurnState = "queued" | "running" | "completed" | "interrupted" | "fa
 
 export interface SpawnRequest {
   task: string;
-  directory: string;
+  projectRoot: string;
+  worktree?: string;
   label?: string;
   agent?: string;
   model?: string;
@@ -35,6 +37,11 @@ export interface TurnReceipt {
   status: "queued" | "running";
 }
 
+export interface MergeReceipt {
+  workerId: WorkerId;
+  status: "merged";
+}
+
 export interface WorkerSnapshot {
   type: "worker";
   workerId: WorkerId;
@@ -43,6 +50,7 @@ export interface WorkerSnapshot {
   queuedTurnIds: TurnId[];
   directory: string;
   label?: string;
+  worktree?: WorktreeInfo;
 }
 
 export interface TurnSnapshot {
@@ -60,11 +68,12 @@ export type TerminalTurnSnapshot = TurnSnapshot & {
 
 export interface WorkerRuntime {
   spawn(request: SpawnRequest): Promise<SpawnReceipt>;
-  list(): Promise<{ workers: WorkerSnapshot[] }>;
+  list(projectRoot?: string): Promise<{ workers: WorkerSnapshot[] }>;
   status(id: WorkerId | TurnId): Promise<WorkerSnapshot | TurnSnapshot>;
   followup(request: FollowupRequest): Promise<TurnReceipt>;
   wait(turnId: TurnId): Promise<TerminalTurnSnapshot>;
   interrupt(workerId: WorkerId): Promise<WorkerSnapshot & { interruptedTurnId?: TurnId }>;
+  merge(workerId: WorkerId): Promise<MergeReceipt>;
   close(workerId: WorkerId): Promise<WorkerSnapshot>;
 }
 
@@ -98,6 +107,7 @@ interface TurnLatch {
 export function createWorkerRuntime(input: {
   client: OpenCodePort;
   stateFile: string;
+  worktrees?: WorktreePort;
 }): HostedWorkerRuntime {
   let registry: Registry;
   try {
@@ -110,6 +120,8 @@ export function createWorkerRuntime(input: {
   const controllers = new Map<TurnId, AbortController>();
   const latches = new Map<TurnId, TurnLatch>();
   const jobs = new Set<Promise<void>>();
+  const mergingWorkers = new Set<WorkerId>();
+  let mergeTail = Promise.resolve();
   let disposing = false;
   let disposePromise: Promise<void> | undefined;
 
@@ -175,26 +187,28 @@ export function createWorkerRuntime(input: {
       await ready;
       if (!request.task.trim()) throw new RuntimeError("INVALID_TASK", "Task cannot be empty.");
 
-      let directory: string;
-      try {
-        directory = await realpath(request.directory);
-      } catch {
-        throw new RuntimeError(
-          "INVALID_DIRECTORY",
-          `Directory ${JSON.stringify(request.directory)} does not exist.`,
-        );
-      }
+      const projectRoot = await canonicalDirectory(request.projectRoot);
+      const worktree = request.worktree ? await createWorktree(projectRoot, request.worktree) : undefined;
+      const directory = worktree?.path ?? projectRoot;
 
-      const sessionId = await input.client.createSession({ directory, label: request.label });
+      let sessionId: string;
+      try {
+        sessionId = await input.client.createSession({ directory, label: request.label });
+      } catch (error) {
+        if (worktree) await rollbackWorktree(projectRoot, worktree);
+        throw error;
+      }
       const workerId = makeWorkerId();
       const turnId = makeTurnId();
       const worker: WorkerRecord = {
         id: workerId,
         sessionId,
+        projectRoot,
         directory,
         label: request.label,
         agent: request.agent,
         model: request.model,
+        worktree,
         status: "running",
         activeTurnId: turnId,
       };
@@ -211,15 +225,17 @@ export function createWorkerRuntime(input: {
         registry.createWorkerAndTurn(worker, turn);
       } catch (error) {
         await Promise.allSettled([input.client.close(sessionId, directory)]);
+        if (worktree) await rollbackWorktree(projectRoot, worktree);
         throw error;
       }
       launch(turn, worker);
       return { workerId, turnId, status: "running" as const, label: request.label };
     },
 
-    async list() {
+    async list(projectRoot) {
       await ready;
-      return { workers: registry.listWorkers().map(workerSnapshot) };
+      const project = projectRoot ? await canonicalDirectory(projectRoot) : undefined;
+      return { workers: registry.listWorkers(project).map(workerSnapshot) };
     },
 
     async status(id) {
@@ -235,6 +251,9 @@ export function createWorkerRuntime(input: {
       const worker = requiredWorker(request.workerId);
       if (worker.status === "closed") {
         throw new RuntimeError("WORKER_CLOSED", `Worker ${request.workerId} is closed.`);
+      }
+      if (mergingWorkers.has(worker.id)) {
+        throw new RuntimeError("WORKER_BUSY", `Worker ${request.workerId} is being merged.`);
       }
 
       const turn: TurnRecord = {
@@ -277,6 +296,37 @@ export function createWorkerRuntime(input: {
       await Promise.allSettled([input.client.abort(worker.sessionId, worker.directory)]);
       if (transition.next) launch(transition.next, requiredWorker(workerId));
       return { ...workerSnapshot(requiredWorker(workerId)), interruptedTurnId };
+    },
+
+    async merge(workerId) {
+      await ready;
+      const worker = requiredWorker(workerId);
+      const worktree = worker.worktree;
+      if (!worktree) {
+        throw new RuntimeError("WORKTREE_REQUIRED", `Worker ${workerId} does not use a managed worktree.`);
+      }
+      if (worker.activeTurnId || registry.queuedTurnIds(worker.id).length > 0 || mergingWorkers.has(worker.id)) {
+        throw new RuntimeError("WORKER_BUSY", `Worker ${workerId} still has active or queued work.`);
+      }
+      const worktrees = input.worktrees;
+      if (!worktrees) throw new RuntimeError("INVALID_USAGE", "Managed worktrees are unavailable.");
+
+      mergingWorkers.add(worker.id);
+      const operation = mergeTail.then(async () => {
+        try {
+          await worktrees.merge(worker.projectRoot, worktree);
+          return { workerId, status: "merged" as const };
+        } catch (error) {
+          if (error instanceof WorktreeError) {
+            throw new RuntimeError(error.code, error.message, error.retryable);
+          }
+          throw error;
+        } finally {
+          mergingWorkers.delete(worker.id);
+        }
+      });
+      mergeTail = operation.then(() => undefined, () => undefined);
+      return operation;
     },
 
     async close(workerId) {
@@ -330,7 +380,25 @@ export function createWorkerRuntime(input: {
       queuedTurnIds: registry.queuedTurnIds(worker.id),
       directory: worker.directory,
       label: worker.label,
+      worktree: worker.worktree,
     };
+  }
+
+  async function createWorktree(projectRoot: string, name: string): Promise<WorktreeInfo> {
+    if (!input.worktrees) throw new RuntimeError("INVALID_USAGE", "Managed worktrees are unavailable.");
+    try {
+      return await input.worktrees.create(projectRoot, name);
+    } catch (error) {
+      if (error instanceof WorktreeError) {
+        throw new RuntimeError(error.code, error.message, error.retryable);
+      }
+      throw error;
+    }
+  }
+
+  async function rollbackWorktree(projectRoot: string, worktree: WorktreeInfo): Promise<void> {
+    if (!input.worktrees) return;
+    await input.worktrees.rollback(projectRoot, worktree);
   }
 
   function getLatch(turnId: TurnId): TurnLatch {
@@ -390,6 +458,14 @@ function makeOpenCodeMessageId(): string {
 
 function isTerminal(status: TurnState): boolean {
   return status === "completed" || status === "interrupted" || status === "failed";
+}
+
+async function canonicalDirectory(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch {
+    throw new RuntimeError("INVALID_DIRECTORY", `Directory ${JSON.stringify(path)} does not exist.`);
+  }
 }
 
 function runtimeErrorBody(error: unknown): RuntimeErrorBody {

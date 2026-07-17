@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpenCodePort } from "./opencode.ts";
 import { createWorkerRuntime, type HostedWorkerRuntime } from "./runtime.ts";
+import type { WorktreePort } from "./worktree.ts";
 
 const temporaryDirectories: string[] = [];
 const runtimes: HostedWorkerRuntime[] = [];
@@ -13,7 +14,7 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
-test("the seven-operation interface manages persistent workers and turns", async () => {
+test("the worker interface manages persistent workers and turns", async () => {
   const directory = await mkdtemp(join(tmpdir(), "opencode-agent-"));
   temporaryDirectories.push(directory);
   const client = new FakeOpenCode();
@@ -23,7 +24,7 @@ test("the seven-operation interface manages persistent workers and turns", async
 
   const first = await runtime.spawn({
     task: "remember 8675309",
-    directory,
+    projectRoot: directory,
     label: "worker",
   });
   expect(first.workerId).toStartWith("wrk_");
@@ -40,8 +41,15 @@ test("the seven-operation interface manages persistent workers and turns", async
   });
   expect((await runtime.wait(second.turnId)).text).toBe("done: what did I ask you to remember?");
 
-  const duplicate = await runtime.spawn({ task: "another task", directory, label: "worker" });
+  const duplicate = await runtime.spawn({ task: "another task", projectRoot: directory, label: "worker" });
   expect((await runtime.list()).workers).toHaveLength(2);
+
+  const otherProject = await mkdtemp(join(tmpdir(), "opencode-agent-other-project-"));
+  temporaryDirectories.push(otherProject);
+  const other = await runtime.spawn({ task: "other project", projectRoot: otherProject });
+  expect((await runtime.list(directory)).workers).toHaveLength(2);
+  expect((await runtime.list(otherProject)).workers).toHaveLength(1);
+  expect((await runtime.list()).workers).toHaveLength(3);
 
   const slow = await runtime.followup({ workerId: first.workerId, message: "slow task" });
   await runtime.interrupt(first.workerId);
@@ -49,10 +57,43 @@ test("the seven-operation interface manages persistent workers and turns", async
 
   expect((await runtime.close(first.workerId)).status).toBe("closed");
   expect((await runtime.wait(duplicate.turnId)).status).toBe("completed");
+  expect((await runtime.wait(other.turnId)).status).toBe("completed");
 
   const reloaded = createWorkerRuntime({ client, stateFile });
   runtimes.push(reloaded);
   expect((await reloaded.status(first.workerId)).status).toBe("closed");
+});
+
+test("merge accepts only idle managed-worktree workers", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-agent-merge-runtime-"));
+  temporaryDirectories.push(directory);
+  const client = new FakeOpenCode();
+  let mergeCalls = 0;
+  const worktrees: WorktreePort = {
+    async create(_projectRoot, name) {
+      return { name, path: directory, branch: `opencode-agent/${name}` };
+    },
+    async merge() {
+      mergeCalls++;
+    },
+    async rollback() {},
+  };
+  const runtime = createWorkerRuntime({
+    client,
+    stateFile: join(directory, "state.sqlite"),
+    worktrees,
+  });
+  runtimes.push(runtime);
+
+  const managed = await runtime.spawn({ task: "slow task", projectRoot: directory, worktree: "parser" });
+  await expect(runtime.merge(managed.workerId)).rejects.toMatchObject({ code: "WORKER_BUSY" });
+  await runtime.interrupt(managed.workerId);
+  expect(await runtime.merge(managed.workerId)).toEqual({ workerId: managed.workerId, status: "merged" });
+  expect(mergeCalls).toBe(1);
+
+  const ordinary = await runtime.spawn({ task: "ordinary", projectRoot: directory });
+  await runtime.wait(ordinary.turnId);
+  await expect(runtime.merge(ordinary.workerId)).rejects.toMatchObject({ code: "WORKTREE_REQUIRED" });
 });
 
 test("active turns reconcile after the runtime is replaced", async () => {
@@ -63,7 +104,7 @@ test("active turns reconcile after the runtime is replaced", async () => {
   const firstRuntime = createWorkerRuntime({ client, stateFile });
   runtimes.push(firstRuntime);
 
-  const spawned = await firstRuntime.spawn({ task: "survive restart", directory });
+  const spawned = await firstRuntime.spawn({ task: "survive restart", projectRoot: directory });
   await firstRuntime[Symbol.asyncDispose]();
 
   const replacement = createWorkerRuntime({ client, stateFile });
@@ -83,13 +124,13 @@ test("workers run concurrently without an adapter limit while each worker stays 
 
   const workers = await Promise.all(
     Array.from({ length: 12 }, (_, index) =>
-      runtime.spawn({ task: `parallel-${index}`, directory }),
+      runtime.spawn({ task: `parallel-${index}`, projectRoot: directory }),
     ),
   );
   await Promise.all(workers.map((worker) => runtime.wait(worker.turnId)));
   expect(client.maxActive).toBeGreaterThan(1);
 
-  const serial = await runtime.spawn({ task: "serial-1", directory });
+  const serial = await runtime.spawn({ task: "serial-1", projectRoot: directory });
   const second = await runtime.followup({ workerId: serial.workerId, message: "serial-2" });
   const third = await runtime.followup({ workerId: serial.workerId, message: "serial-3" });
   await Promise.all([runtime.wait(serial.turnId), runtime.wait(second.turnId), runtime.wait(third.turnId)]);

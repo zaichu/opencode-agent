@@ -42,7 +42,6 @@ class OpenCodeFailure extends Error {
     readonly code: string,
     message: string,
     readonly retryable: boolean,
-    readonly status?: number,
   ) {
     super(message);
   }
@@ -51,16 +50,13 @@ class OpenCodeFailure extends Error {
 class OpenCodeClient {
   constructor(private readonly baseUrl = "http://127.0.0.1:4096") {}
 
-  async health(): Promise<{ healthy: true; version?: string } | null> {
+  async health(): Promise<boolean> {
     try {
       const response = await fetch(new URL("/global/health", this.baseUrl));
-      if (!response.ok) return null;
-      const body = (await response.json()) as { healthy?: unknown; version?: unknown };
-      return body.healthy === true
-        ? { healthy: true, version: typeof body.version === "string" ? body.version : undefined }
-        : null;
+      if (!response.ok) return false;
+      return ((await response.json()) as { healthy?: unknown }).healthy === true;
     } catch {
-      return null;
+      return false;
     }
   }
 
@@ -197,7 +193,6 @@ class OpenCodeClient {
           detail ? `: ${detail}` : ""
         }`,
         retryable,
-        response.status,
       );
     }
     return response;

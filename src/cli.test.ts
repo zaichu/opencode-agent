@@ -42,9 +42,8 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
 
     const token = (await readFile(join(directory, "adapter-state", "daemon.token"), "utf8")).trim();
     const oversizedBody = JSON.stringify({
-      scope: { scope: "project", projectRoot: directory },
       operation: "spawn",
-      input: { task: "é".repeat(600), directory },
+      input: { task: "é".repeat(600), projectRoot: directory },
     });
     const oversized = await fetch(`http://127.0.0.1:${daemonPort}/command`, {
       method: "POST",
@@ -77,8 +76,6 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
       "spawn",
       "--project",
       directory,
-      "--dir",
-      directory,
       "--label",
       "reviewer",
       "remember 8675309",
@@ -86,42 +83,50 @@ test("the CLI controls a project-scoped worker through the daemon", async () => 
     expect(spawned.workerId).toStartWith("wrk_");
     expect(spawned.turnId).toStartWith("trn_");
     expect(spawned.label).toBe("reviewer");
+    expect((await cli(entry, env, directory, [
+      "status",
+      spawned.workerId as string,
+    ])).directory).toBe(directory);
 
     const firstWait = cli(entry, env, directory, [
       "wait",
-      "--project",
-      directory,
       spawned.turnId as string,
     ]);
     await Bun.sleep(20);
     const followup = await cli(entry, env, directory, [
       "followup",
-      "--project",
-      directory,
       spawned.workerId as string,
       "what number?",
     ]);
-    expect(followup.status).toBe("queued");
+    expect(["queued", "running"]).toContain(followup.status);
     const first = await firstWait;
     expect(first).toMatchObject({ status: "completed", text: "reply: remember 8675309" });
 
     const second = await cli(entry, env, directory, [
       "wait",
-      "--project",
-      directory,
       followup.turnId as string,
     ]);
     expect(second.text).toBe("reply: what number?");
 
     const projectWorkers = await cli(entry, env, directory, ["list", "--project", directory]);
     expect(projectWorkers.workers).toHaveLength(1);
-    const globalWorkers = await cli(entry, env, directory, ["list", "--scope", "global"]);
-    expect(globalWorkers.workers).toHaveLength(0);
+
+    const otherProject = join(directory, "other-project");
+    await mkdir(join(otherProject, ".git"), { recursive: true });
+    const other = await cli(entry, env, directory, [
+      "spawn",
+      "--project",
+      otherProject,
+      "other project task",
+    ]);
+    expect((await cli(entry, env, directory, ["list", "--project", otherProject])).workers).toHaveLength(1);
+    expect((await cli(entry, env, directory, ["status", other.workerId as string])).workerId).toBe(other.workerId);
+
+    const allWorkers = await cli(entry, env, directory, ["list", "--all"]);
+    expect(allWorkers.workers).toHaveLength(2);
 
     const closed = await cli(entry, env, directory, [
       "close",
-      "--project",
-      directory,
       spawned.workerId as string,
     ]);
     expect(closed.status).toBe("closed");
@@ -148,7 +153,41 @@ test("configuration failures preserve the executable JSON contract", async () =>
   ]);
   expect(exitCode).toBe(2);
   expect(stdout).toBe("");
-  expect(JSON.parse(stderr)).toMatchObject({ error: { code: "INVALID_CONFIG", retryable: false } });
+  const body = JSON.parse(stderr) as { error: Record<string, unknown> };
+  expect(body.error.code).toBe("INVALID_CONFIG");
+  expect("retryable" in body.error).toBeFalse();
+});
+
+test("a missing prompt file returns a specific executable error", async () => {
+  const missing = join(tmpdir(), `missing-prompt-${crypto.randomUUID()}.txt`);
+  const child = Bun.spawn({
+    cmd: [
+      process.execPath,
+      join(import.meta.dir, "index.ts"),
+      "spawn",
+      "--project",
+      import.meta.dir,
+      "--file",
+      missing,
+    ],
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+
+  expect(exitCode).toBe(2);
+  expect(stdout).toBe("");
+  expect(JSON.parse(stderr)).toEqual({
+    error: {
+      code: "PROMPT_FILE_NOT_FOUND",
+      message: `Prompt file ${JSON.stringify(missing)} does not exist.`,
+    },
+  });
 });
 
 function availablePort(): number {

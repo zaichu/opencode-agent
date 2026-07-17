@@ -3,31 +3,25 @@ import { join } from "node:path";
 import type { AdapterConfig } from "./config.ts";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION } from "./config.ts";
 import { ManagedOpenCode } from "./opencode.ts";
-import { ProtocolError, decodeCommand, type DecodedCommand, type ErrorBody, type Scope } from "./protocol.ts";
+import { ProtocolError, decodeCommand, type DecodedCommand, type ErrorBody } from "./protocol.ts";
 import {
   RuntimeError,
   createWorkerRuntime,
-  type HostedWorkerRuntime,
   type WorkerRuntime,
 } from "./runtime.ts";
 import { daemonToken, stateFileFor } from "./scope.ts";
+import { GitWorktrees } from "./worktree.ts";
 
 export async function runDaemon(config: AdapterConfig): Promise<void> {
   await mkdir(config.dataRoot, { recursive: true, mode: 0o700 });
   const lock = await acquireDaemonLock(config);
   const token = await daemonToken(config.dataRoot);
   const openCode = new ManagedOpenCode(config.openCodeUrl, config.openCodeBinary);
-  const runtimes = new Map<string, HostedWorkerRuntime>();
-
-  const runtimeFor = async (scope: Scope): Promise<WorkerRuntime> => {
-    const stateFile = await stateFileFor(config.dataRoot, scope);
-    let runtime = runtimes.get(stateFile);
-    if (!runtime) {
-      runtime = createWorkerRuntime({ client: openCode, stateFile });
-      runtimes.set(stateFile, runtime);
-    }
-    return runtime;
-  };
+  const runtime = createWorkerRuntime({
+    client: openCode,
+    stateFile: await stateFileFor(config.dataRoot),
+    worktrees: new GitWorktrees(join(config.dataRoot, "worktrees")),
+  });
 
   let server: ReturnType<typeof Bun.serve>;
   try {
@@ -66,7 +60,6 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
           }
           const source = new TextDecoder().decode(bytes);
           const command = decodeCommand(JSON.parse(source));
-          const runtime = await runtimeFor(command.scope);
           return json(await dispatch(runtime, command));
         } catch (error) {
           const body = errorBody(error);
@@ -84,8 +77,7 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
     if (stopping) return;
     stopping = true;
     server.stop(true);
-    await Promise.allSettled([...runtimes.values()].map((runtime) => runtime[Symbol.asyncDispose]()));
-    runtimes.clear();
+    await runtime[Symbol.asyncDispose]();
     await openCode.stop();
     await lock.release();
   };
@@ -100,7 +92,7 @@ async function dispatch(runtime: WorkerRuntime, command: DecodedCommand): Promis
     case "spawn":
       return runtime.spawn(command.input);
     case "list":
-      return runtime.list();
+      return runtime.list(command.input.projectRoot);
     case "status":
       return runtime.status(command.input.id);
     case "followup":
@@ -109,6 +101,8 @@ async function dispatch(runtime: WorkerRuntime, command: DecodedCommand): Promis
       return runtime.wait(command.input.turnId);
     case "interrupt":
       return runtime.interrupt(command.input.workerId);
+    case "merge":
+      return runtime.merge(command.input.workerId);
     case "close":
       return runtime.close(command.input.workerId);
   }
@@ -123,29 +117,40 @@ function json(value: unknown, status = 200): Response {
 
 
 function errorBody(error: unknown): ErrorBody {
-  if (error instanceof RuntimeError) return error.toJSON();
-  if (error instanceof ProtocolError) return { code: error.code, message: error.message, retryable: false };
+  if (error instanceof RuntimeError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.retryable ? { retryable: true as const } : {}),
+    };
+  }
+  if (error instanceof ProtocolError) return { code: error.code, message: error.message };
   return {
     code: "INTERNAL_ERROR",
     message: error instanceof Error ? error.message : String(error),
-    retryable: false,
   };
 }
 
 function httpStatus(code: string): number {
   if (code === "WORKER_NOT_FOUND" || code === "TURN_NOT_FOUND") return 404;
   if (code === "UNAUTHORIZED") return 401;
-  if (code === "WORKER_CLOSED") return 409;
+  if (
+    code === "WORKER_CLOSED" ||
+    code === "WORKER_BUSY" ||
+    code === "WORKTREE_REQUIRED" ||
+    code === "WORKTREE_EXISTS" ||
+    code === "DIRTY_TARGET" ||
+    code === "WORKTREE_COMMIT_FAILED" ||
+    code === "WORKTREE_MERGE_FAILED"
+  ) return 409;
   if (code === "REQUEST_TOO_LARGE") return 413;
   if (code.startsWith("INVALID_")) return 400;
   return 500;
 }
 
-interface DaemonLock {
-  release(): Promise<void>;
-}
-
-async function acquireDaemonLock(config: AdapterConfig): Promise<DaemonLock> {
+async function acquireDaemonLock(
+  config: AdapterConfig,
+): Promise<{ release(): Promise<void> }> {
   const path = join(config.dataRoot, "daemon.lock");
   for (let attempt = 0; attempt < 2; attempt++) {
     let handle: FileHandle;
@@ -165,10 +170,7 @@ async function acquireDaemonLock(config: AdapterConfig): Promise<DaemonLock> {
       });
       continue;
     }
-    await handle.writeFile(
-      JSON.stringify({ pid: process.pid, port: config.daemonPort, protocol: PROTOCOL_VERSION }),
-      "utf8",
-    );
+    await handle.writeFile(JSON.stringify({ pid: process.pid }), "utf8");
     let released = false;
     return {
       async release() {

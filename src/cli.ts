@@ -3,9 +3,9 @@ import { join, resolve } from "node:path";
 import { parseArgs as parseNodeArgs } from "node:util";
 import type { AdapterConfig } from "./config.ts";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION } from "./config.ts";
-import type { CommandRequest, ErrorBody, Scope } from "./protocol.ts";
+import type { CommandRequest, ErrorBody } from "./protocol.ts";
 import { RuntimeError } from "./runtime.ts";
-import { daemonToken, resolveScope } from "./scope.ts";
+import { daemonToken, resolveProject } from "./scope.ts";
 
 interface ParsedArgs {
   options: Map<string, string>;
@@ -25,12 +25,11 @@ export async function runCli(argv: string[], config: AdapterConfig): Promise<voi
     return;
   }
 
-  const scope = await resolveScope({
-    scope: parsed.options.get("scope"),
+  const projectRoot = await resolveProject({
     project: parsed.options.get("project"),
     cwd: process.cwd(),
   });
-  const request = await makeRequest(command, parsed, scope);
+  const request = await makeRequest(command, parsed, projectRoot);
   const result = await callDaemon(request, config);
   printResult(result, parsed.flags.has("text"));
 }
@@ -38,33 +37,37 @@ export async function runCli(argv: string[], config: AdapterConfig): Promise<voi
 async function makeRequest(
   command: string,
   parsed: ParsedArgs,
-  scope: Scope,
+  projectRoot: string,
 ): Promise<CommandRequest> {
   rejectUnusedOptions(parsed, command);
 
   switch (command) {
-    case "spawn":
+    case "spawn": {
+      const worktree = parsed.options.get("worktree");
       return {
-        scope,
         operation: "spawn",
         input: {
           task: await readPrompt(parsed),
-          directory: resolve(parsed.options.get("dir") ?? process.cwd()),
+          projectRoot,
+          worktree,
           label: parsed.options.get("label"),
           agent: parsed.options.get("agent"),
           model: parsed.options.get("model"),
         },
       };
+    }
     case "list":
       requirePositionals(parsed, 0, "list");
-      return { scope, operation: "list", input: {} };
+      if (parsed.flags.has("all") && parsed.options.has("project")) {
+        throw usage("--all and --project cannot be used together.");
+      }
+      return { operation: "list", input: { projectRoot: parsed.flags.has("all") ? undefined : projectRoot } };
     case "status":
-      return { scope, operation: "status", input: { id: oneId(parsed, "status") } };
+      return { operation: "status", input: { id: oneId(parsed, "status") } };
     case "followup": {
       const workerId = parsed.positionals.shift();
       if (!workerId) throw usage("followup requires a Worker ID.");
       return {
-        scope,
         operation: "followup",
         input: {
           workerId,
@@ -75,11 +78,13 @@ async function makeRequest(
       };
     }
     case "wait":
-      return { scope, operation: "wait", input: { turnId: oneId(parsed, "wait") } };
+      return { operation: "wait", input: { turnId: oneId(parsed, "wait") } };
     case "interrupt":
-      return { scope, operation: "interrupt", input: { workerId: oneId(parsed, "interrupt") } };
+      return { operation: "interrupt", input: { workerId: oneId(parsed, "interrupt") } };
+    case "merge":
+      return { operation: "merge", input: { workerId: oneId(parsed, "merge") } };
     case "close":
-      return { scope, operation: "close", input: { workerId: oneId(parsed, "close") } };
+      return { operation: "close", input: { workerId: oneId(parsed, "close") } };
     default:
       throw usage(`Unknown command ${JSON.stringify(command)}.`);
   }
@@ -176,9 +181,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       allowPositionals: true,
       strict: true,
       options: {
-        dir: { type: "string" }, label: { type: "string" }, agent: { type: "string" },
-        model: { type: "string" }, file: { type: "string" }, scope: { type: "string" },
-        project: { type: "string" }, stdin: { type: "boolean" }, text: { type: "boolean" },
+        worktree: { type: "string" }, label: { type: "string" }, agent: { type: "string" },
+        model: { type: "string" }, file: { type: "string" }, project: { type: "string" },
+        stdin: { type: "boolean" }, text: { type: "boolean" }, all: { type: "boolean" },
         help: { type: "boolean" }, version: { type: "boolean" },
       },
     });
@@ -195,15 +200,15 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function rejectUnusedOptions(parsed: ParsedArgs, command: string): void {
-  const common = new Set(["scope", "project"]);
   const allowed: Record<string, Set<string>> = {
-    spawn: new Set([...common, "dir", "label", "agent", "model", "file"]),
-    followup: new Set([...common, "agent", "model", "file"]),
-    list: common,
-    status: common,
-    wait: common,
-    interrupt: common,
-    close: common,
+    spawn: new Set(["project", "worktree", "label", "agent", "model", "file"]),
+    followup: new Set(["agent", "model", "file"]),
+    list: new Set(["project"]),
+    status: new Set(),
+    wait: new Set(),
+    interrupt: new Set(),
+    merge: new Set(),
+    close: new Set(),
   };
   const commandOptions = allowed[command];
   if (!commandOptions) return;
@@ -212,6 +217,9 @@ function rejectUnusedOptions(parsed: ParsedArgs, command: string): void {
   }
   if (parsed.flags.has("stdin") && command !== "spawn" && command !== "followup") {
     throw usage(`--stdin cannot be used with ${command}.`);
+  }
+  if (parsed.flags.has("all") && command !== "list") {
+    throw usage(`--all cannot be used with ${command}.`);
   }
 }
 
@@ -223,13 +231,28 @@ async function readPrompt(parsed: ParsedArgs): Promise<string> {
   if (sources !== 1) throw usage("Supply exactly one prompt: arguments, --file, or --stdin.");
 
   const value = fromFile
-    ? await readFile(resolve(fromFile), "utf8")
+    ? await readPromptFile(fromFile)
     : fromStdin
       ? await new Response(Bun.stdin.stream()).text()
       : parsed.positionals.join(" ");
   parsed.positionals = [];
   if (!value.trim()) throw usage("Prompt cannot be empty.");
   return value;
+}
+
+async function readPromptFile(path: string): Promise<string> {
+  const resolvedPath = resolve(path);
+  try {
+    return await readFile(resolvedPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new RuntimeError(
+        "PROMPT_FILE_NOT_FOUND",
+        `Prompt file ${JSON.stringify(resolvedPath)} does not exist.`,
+      );
+    }
+    throw error;
+  }
 }
 
 function oneId(parsed: ParsedArgs, command: string): string {
@@ -269,14 +292,15 @@ Usage:
   opencode-agent followup [options] <worker-id> <message>
   opencode-agent wait [options] <turn-id>
   opencode-agent interrupt [options] <worker-id>
+  opencode-agent merge [options] <worker-id>
   opencode-agent close [options] <worker-id>
 
-Scope:
-  --scope project|global   State scope (default: project)
-  --project <path>         Project registry to use from another directory
+Project:
+  --project <path>         Project to work in (default: current Git root)
+  --all                    List workers across every project
 
 Spawn:
-  --dir <path>             Worker directory (default: current directory)
+  --worktree <name>        Create an isolated Git worktree and branch
   --label <label>          Optional display label; duplicates are allowed
   --agent <agent>          OpenCode agent
   --model <provider/model> OpenCode model

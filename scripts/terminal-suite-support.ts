@@ -1,17 +1,18 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFakeOpenCode } from "../test/fake-opencode.ts";
 
 export interface TerminalFixture extends AsyncDisposable {
+  cwd: string;
   json(args: string[]): Promise<Record<string, any>>;
   failure(args: string[]): Promise<{ exitCode: number; body: Record<string, any> }>;
 }
 
 export async function createTerminalFixture(executable: string): Promise<TerminalFixture> {
   const root = await mkdtemp(join(tmpdir(), "opencode-agent-terminal-"));
-  await mkdir(join(root, ".git"));
-  const dataRoot = join(root, "adapter-state");
+  const dataRoot = await mkdtemp(join(tmpdir(), "opencode-agent-state-"));
+  await initializeRepository(root);
   const openCode = startFakeOpenCode();
   return createHostedTerminalFixture({
     executable,
@@ -20,9 +21,30 @@ export async function createTerminalFixture(executable: string): Promise<Termina
     openCodeUrl: openCode.url,
     async dispose() {
       openCode.stop();
+      await removeTree(dataRoot);
       await removeTree(root);
     },
   });
+}
+
+async function initializeRepository(root: string): Promise<void> {
+  await git(root, "init", "-b", "main");
+  await git(root, "config", "user.email", "tests@opencode-agent.local");
+  await git(root, "config", "user.name", "opencode-agent tests");
+  await writeFile(join(root, "tracked.txt"), "main\n");
+  await git(root, "add", "tracked.txt");
+  await git(root, "commit", "-m", "initial");
+}
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`);
+  return stdout.trim();
 }
 
 export async function createLiveTerminalFixture(
@@ -91,6 +113,7 @@ async function createHostedTerminalFixture(input: {
   };
 
   return {
+    cwd: input.cwd,
     async json(args: string[]): Promise<Record<string, any>> {
       const result = await run(args);
       if (result.exitCode !== 0) {

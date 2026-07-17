@@ -1,23 +1,20 @@
 import type { TurnId, WorkerId } from "./runtime.ts";
 
-export type Scope = { scope: "global" } | { scope: "project"; projectRoot: string };
-
 type CommandFor<Worker extends string, Turn extends string> =
   | {
-      scope: Scope;
       operation: "spawn";
-      input: { task: string; directory: string; label?: string; agent?: string; model?: string };
+      input: { task: string; projectRoot: string; worktree?: string; label?: string; agent?: string; model?: string };
     }
-  | { scope: Scope; operation: "list"; input: Record<never, never> }
-  | { scope: Scope; operation: "status"; input: { id: Worker | Turn } }
+  | { operation: "list"; input: { projectRoot?: string } }
+  | { operation: "status"; input: { id: Worker | Turn } }
   | {
-      scope: Scope;
       operation: "followup";
       input: { workerId: Worker; message: string; agent?: string; model?: string };
     }
-  | { scope: Scope; operation: "wait"; input: { turnId: Turn } }
-  | { scope: Scope; operation: "interrupt"; input: { workerId: Worker } }
-  | { scope: Scope; operation: "close"; input: { workerId: Worker } };
+  | { operation: "wait"; input: { turnId: Turn } }
+  | { operation: "interrupt"; input: { workerId: Worker } }
+  | { operation: "merge"; input: { workerId: Worker } }
+  | { operation: "close"; input: { workerId: Worker } };
 
 export type CommandRequest = CommandFor<string, string>;
 export type DecodedCommand = CommandFor<WorkerId, TurnId>;
@@ -25,7 +22,7 @@ export type DecodedCommand = CommandFor<WorkerId, TurnId>;
 export interface ErrorBody {
   code: string;
   message: string;
-  retryable: boolean;
+  retryable?: true;
 }
 
 export class ProtocolError extends Error {
@@ -36,29 +33,27 @@ export class ProtocolError extends Error {
 
 export function decodeCommand(value: unknown): DecodedCommand {
   const request = object(value, "Invalid daemon request.");
-  const scope = decodeScope(request.scope);
   const input = object(request.input, "Invalid daemon command input.");
 
   switch (request.operation) {
     case "spawn":
       return {
-        scope,
         operation: "spawn",
         input: {
           task: stringField(input, "task"),
-          directory: stringField(input, "directory"),
+          projectRoot: stringField(input, "projectRoot"),
+          worktree: optionalString(input, "worktree"),
           label: optionalString(input, "label"),
           agent: optionalString(input, "agent"),
           model: optionalString(input, "model"),
         },
       };
     case "list":
-      return { scope, operation: "list", input: {} };
+      return { operation: "list", input: { projectRoot: optionalString(input, "projectRoot") } };
     case "status":
-      return { scope, operation: "status", input: { id: agentId(input, "id") } };
+      return { operation: "status", input: { id: agentId(input, "id") } };
     case "followup":
       return {
-        scope,
         operation: "followup",
         input: {
           workerId: workerId(input, "workerId"),
@@ -68,23 +63,16 @@ export function decodeCommand(value: unknown): DecodedCommand {
         },
       };
     case "wait":
-      return { scope, operation: "wait", input: { turnId: turnId(input, "turnId") } };
+      return { operation: "wait", input: { turnId: turnId(input, "turnId") } };
     case "interrupt":
-      return { scope, operation: "interrupt", input: { workerId: workerId(input, "workerId") } };
+      return { operation: "interrupt", input: { workerId: workerId(input, "workerId") } };
+    case "merge":
+      return { operation: "merge", input: { workerId: workerId(input, "workerId") } };
     case "close":
-      return { scope, operation: "close", input: { workerId: workerId(input, "workerId") } };
+      return { operation: "close", input: { workerId: workerId(input, "workerId") } };
     default:
       throw new ProtocolError("INVALID_USAGE", "Invalid daemon operation.");
   }
-}
-
-function decodeScope(value: unknown): Scope {
-  const scope = object(value, "Invalid daemon scope.");
-  if (scope.scope === "global") return { scope: "global" };
-  if (scope.scope === "project" && typeof scope.projectRoot === "string" && scope.projectRoot) {
-    return { scope: "project", projectRoot: scope.projectRoot };
-  }
-  throw new ProtocolError("INVALID_USAGE", "Invalid daemon scope.");
 }
 
 function object(value: unknown, message: string): Record<string, unknown> {

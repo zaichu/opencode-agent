@@ -34,6 +34,7 @@ Use the Turn ID to inspect or wait for that task. Use the Worker ID to continue 
 opencode-agent status trn_...
 opencode-agent wait trn_...
 opencode-agent followup wrk_... "Fix the highest-severity bug."
+opencode-agent merge wrk_...
 opencode-agent close wrk_...
 ```
 
@@ -49,6 +50,7 @@ Labels are display names and may be duplicated. Always manage workers by ID.
 | `followup <worker-id> <message>` | Queues another turn in the same conversation |
 | `wait <turn-id>` | Blocks until the turn completes, fails, or is interrupted |
 | `interrupt <worker-id>` | Stops the active turn but keeps the worker open |
+| `merge <worker-id>` | Commits and merges an idle managed-worktree worker into the project checkout |
 | `close <worker-id>` | Stops the worker, cancels its queue, and closes its OpenCode session |
 
 There is no separate `result` command. A completed turn's text is returned by `status` and `wait`.
@@ -56,12 +58,12 @@ There is no separate `result` command. A completed turn's text is returned by `s
 ## Options
 
 ```text
---dir <path>             Worker directory; defaults to the current directory
+--worktree <name>        Create an isolated Git worktree and branch for the worker
 --label <label>          Optional display label
 --agent <agent>          Optional OpenCode agent override
 --model <provider/model> Optional OpenCode model override
---scope project|global   Registry scope; defaults to project
---project <path>         Select another project's registry
+--project <path>         Select the project where the worker operates
+--all                    List workers across every project
 --file <path>            Read the task or follow-up from a file
 --stdin                  Read the task or follow-up from stdin
 --text                   Print only human-readable result text
@@ -91,14 +93,15 @@ Codex, Claude Code, CI, and custom orchestrators use the same CLI contract:
 1. Run `spawn` and retain both returned IDs.
 2. Use `status <turn-id>` for a nonblocking check or `wait <turn-id>` when blocking is safe.
 3. Send follow-ups to the Worker ID and retain each new Turn ID.
-4. Use `interrupt` for the active turn or `close` when the conversation is finished.
+4. For a managed worktree, validate the result and run `merge <worker-id>`.
+5. Use `interrupt` for active work or `close` when the conversation is finished.
 
-Keep registry scope consistent across commands: run from the same Git project, pass the same `--project`, or use `--scope global` each time.
+Worker and Turn IDs work from any directory. `--project` is needed only when spawning outside the target project or filtering `list`; use `list --all` to see every project.
 
 JSON is the default. Successful commands write one JSON value to stdout. Failures write one JSON error to stderr and exit nonzero:
 
 ```json
-{"error":{"code":"WORKER_NOT_FOUND","message":"Worker wrk_... was not found.","retryable":false}}
+{"error":{"code":"WORKER_NOT_FOUND","message":"Worker wrk_... was not found."}}
 ```
 
 The response omits OpenCode reasoning, internal events, session IDs, token details, and cost.
@@ -111,6 +114,24 @@ Workers run concurrently without a fixed adapter limit. Turns within one worker 
 
 Do not let write-capable workers edit the same checkout concurrently. Give overlapping workers separate Git worktrees.
 
+### Managed worktrees
+
+Use a named worktree for isolated write work:
+
+```text
+opencode-agent spawn --worktree parser --agent build "Fix the parser and run its tests."
+```
+
+The command creates branch `opencode-agent/parser`, checks it out under the adapter's user-data directory, and binds the worker to it. The normal `spawn` receipt remains limited to Worker ID, Turn ID, status, and optional label. A worktree name must be unique within its project.
+
+`followup` retains the worktree and may select another agent. Once the worker is idle and its changes have been validated, merge it by Worker ID:
+
+```text
+opencode-agent merge wrk_...
+```
+
+`merge` refuses active or queued workers and a project checkout with uncommitted changes. It commits all worktree changes, merges the branch into the current project branch, and returns only `{"workerId":"wrk_...","status":"merged"}`. The worker and worktree remain available for follow-ups. `close` also preserves the checkout and branch.
+
 ## Server, state, and permissions
 
 You normally do not need to start `opencode serve`. On first use, the adapter daemon:
@@ -119,7 +140,7 @@ You normally do not need to start `opencode serve`. On first use, the adapter da
 - starts `opencode serve` when that local server is absent;
 - stores workers and turns in SQLite under the OS user-data directory.
 
-State is project-scoped by default using the nearest Git root. `--project` selects another project registry; `--dir` controls where the worker reads and writes.
+The adapter uses one per-user SQLite database for every project. Each worker has a required project root; there are no projectless or nullable-project workers. The nearest Git root is used by default, `--project` selects another project, and `--worktree` creates an isolated checkout belonging to it.
 
 Workers are non-interactive. OpenCode permission requests for active adapter turns are approved. Questions requiring a user answer are rejected because the CLI cannot relay them yet. Only delegate trusted tasks and directories.
 

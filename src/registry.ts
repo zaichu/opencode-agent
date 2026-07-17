@@ -1,15 +1,18 @@
 import { Database, type Statement } from "bun:sqlite";
 import type { RuntimeErrorBody, TurnId, TurnState, WorkerId, WorkerState } from "./runtime.ts";
+import type { WorktreeInfo } from "./worktree.ts";
 
 const SCHEMA_VERSION = 1;
 
 export interface WorkerRecord {
   id: WorkerId;
   sessionId: string;
+  projectRoot: string;
   directory: string;
   label?: string;
   agent?: string;
   model?: string;
+  worktree?: WorktreeInfo;
   status: WorkerState;
   activeTurnId: TurnId | null;
 }
@@ -29,10 +32,13 @@ export interface TurnRecord {
 interface WorkerRow {
   id: string;
   session_id: string;
+  project_root: string;
   directory: string;
   label: string | null;
   agent: string | null;
   model: string | null;
+  worktree_name: string | null;
+  worktree_branch: string | null;
   status: WorkerState;
   active_turn_id: string | null;
 }
@@ -56,6 +62,7 @@ export class Registry {
   private readonly getWorkerStatement: Statement<WorkerRow, [string]>;
   private readonly getTurnStatement: Statement<TurnRow, [string]>;
   private readonly listWorkersStatement: Statement<WorkerRow, []>;
+  private readonly listProjectWorkersStatement: Statement<WorkerRow, [string]>;
   private readonly queuedIdsStatement: Statement<{ id: string }, [string]>;
   private readonly runningTurnsStatement: Statement<TurnRow, []>;
 
@@ -68,7 +75,8 @@ export class Registry {
       this.database.exec("PRAGMA busy_timeout = 5000");
       this.migrateSchema();
       this.getWorkerStatement = this.database.query<WorkerRow, [string]>(
-        "SELECT id, session_id, directory, label, agent, model, status, active_turn_id FROM workers WHERE id = ?1",
+        `SELECT id, session_id, project_root, directory, label, agent, model, worktree_name, worktree_branch,
+                status, active_turn_id FROM workers WHERE id = ?1`,
       );
       this.getTurnStatement = this.database.query<TurnRow, [string]>(
         `SELECT id, worker_id, message, opencode_message_id, agent, model, status, text,
@@ -76,7 +84,12 @@ export class Registry {
            FROM turns WHERE id = ?1`,
       );
       this.listWorkersStatement = this.database.query<WorkerRow, []>(
-        "SELECT id, session_id, directory, label, agent, model, status, active_turn_id FROM workers ORDER BY created_at",
+        `SELECT id, session_id, project_root, directory, label, agent, model, worktree_name, worktree_branch,
+                status, active_turn_id FROM workers ORDER BY created_at`,
+      );
+      this.listProjectWorkersStatement = this.database.query<WorkerRow, [string]>(
+        `SELECT id, session_id, project_root, directory, label, agent, model, worktree_name, worktree_branch,
+                status, active_turn_id FROM workers WHERE project_root = ?1 ORDER BY created_at`,
       );
       this.queuedIdsStatement = this.database.query<{ id: string }, [string]>(
         "SELECT id FROM turns WHERE worker_id = ?1 AND status = 'queued' ORDER BY ordinal",
@@ -102,16 +115,20 @@ export class Registry {
       this.database
         .query(
           `INSERT INTO workers
-             (id, session_id, directory, label, agent, model, status, active_turn_id, created_at, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)`,
+             (id, session_id, project_root, directory, label, agent, model, worktree_name,
+              worktree_branch, status, active_turn_id, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)`,
         )
         .run(
           worker.id,
           worker.sessionId,
+          worker.projectRoot,
           worker.directory,
           worker.label ?? null,
           worker.agent ?? null,
           worker.model ?? null,
+          worker.worktree?.name ?? null,
+          worker.worktree?.branch ?? null,
           worker.status,
           worker.activeTurnId,
           now,
@@ -218,8 +235,11 @@ export class Registry {
     return row ? turnFromRow(row) : null;
   }
 
-  listWorkers(): WorkerRecord[] {
-    return this.listWorkersStatement.all().map(workerFromRow);
+  listWorkers(projectRoot?: string): WorkerRecord[] {
+    const rows = projectRoot
+      ? this.listProjectWorkersStatement.all(projectRoot)
+      : this.listWorkersStatement.all();
+    return rows.map(workerFromRow);
   }
 
   queuedTurnIds(workerId: WorkerId): TurnId[] {
@@ -291,10 +311,13 @@ export class Registry {
         CREATE TABLE workers (
           id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL UNIQUE,
+          project_root TEXT NOT NULL,
           directory TEXT NOT NULL,
           label TEXT,
           agent TEXT,
           model TEXT,
+          worktree_name TEXT,
+          worktree_branch TEXT,
           status TEXT NOT NULL,
           active_turn_id TEXT,
           created_at INTEGER NOT NULL,
@@ -330,10 +353,15 @@ function workerFromRow(row: WorkerRow): WorkerRecord {
   return {
     id: row.id as WorkerId,
     sessionId: row.session_id,
+    projectRoot: row.project_root,
     directory: row.directory,
     label: row.label ?? undefined,
     agent: row.agent ?? undefined,
     model: row.model ?? undefined,
+    worktree:
+      row.worktree_name && row.worktree_branch
+        ? { name: row.worktree_name, path: row.directory, branch: row.worktree_branch }
+        : undefined,
     status: row.status,
     activeTurnId: row.active_turn_id as TurnId | null,
   };

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { createTerminalFixture } from "./terminal-suite-support.ts";
 
 const executable = Bun.which("opencode-agent");
@@ -51,6 +53,38 @@ await test("a persistent worker completes a turn and remembers a follow-up", asy
   assert.equal(second.text, "BLUE-4821");
 });
 
+await test("a named worktree is created, merged by worker ID, and preserved", async () => {
+  await using fixture = await createTerminalFixture(executable);
+  const spawned = await fixture.json([
+    "spawn",
+    "--worktree",
+    "parser",
+    "--agent",
+    "build",
+    "Inspect the parser worktree and reply READY.",
+  ]);
+  assert.equal(spawned.worktree, undefined);
+  assert.equal((await fixture.json(["wait", spawned.turnId])).status, "completed");
+
+  const worker = await fixture.json(["status", spawned.workerId]);
+  assert.deepEqual({ name: worker.worktree.name, branch: worker.worktree.branch }, {
+    name: "parser",
+    branch: "opencode-agent/parser",
+  });
+  assert.equal(worker.directory, worker.worktree.path);
+  await stat(worker.worktree.path);
+  await writeFile(join(worker.worktree.path, "worker-change.txt"), "merged\n");
+
+  assert.deepEqual(await fixture.json(["merge", spawned.workerId]), {
+    workerId: spawned.workerId,
+    status: "merged",
+  });
+  assert.equal((await Bun.file(join(fixture.cwd, "worker-change.txt")).text()).trim(), "merged");
+
+  assert.equal((await fixture.json(["close", spawned.workerId])).status, "closed");
+  await stat(worker.worktree.path);
+});
+
 await test("status, list, interrupt, and close manage a long-running worker", async () => {
   await using fixture = await createTerminalFixture(executable);
   const spawned = await fixture.json([
@@ -66,7 +100,7 @@ await test("status, list, interrupt, and close manage a long-running worker", as
   const listed = await fixture.json(["list"]);
   assert.equal(listed.workers.length, 1);
   assert.equal(listed.workers[0].workerId, spawned.workerId);
-  assert.equal((await fixture.json(["list", "--scope", "global"])).workers.length, 0);
+  assert.equal((await fixture.json(["list", "--all"])).workers.length, 1);
 
   const interrupted = await fixture.json(["interrupt", spawned.workerId]);
   assert.equal(interrupted.interruptedTurnId, spawned.turnId);
@@ -82,7 +116,25 @@ await test("invalid terminal input returns structured JSON on stderr", async () 
   const failure = await fixture.failure(["status", "not-an-agent-id"]);
   assert.equal(failure.exitCode, 2);
   assert.equal(failure.body.error.code, "INVALID_ID");
-  assert.equal(failure.body.error.retryable, false);
+  assert.equal("retryable" in failure.body.error, false);
+
+  const removedDirectoryOption = await fixture.failure([
+    "spawn",
+    "--dir",
+    ".",
+    "do work",
+  ]);
+  assert.equal(removedDirectoryOption.exitCode, 2);
+  assert.equal(removedDirectoryOption.body.error.code, "INVALID_USAGE");
+
+  const removedScopeOption = await fixture.failure([
+    "spawn",
+    "--scope",
+    "global",
+    "do work",
+  ]);
+  assert.equal(removedScopeOption.exitCode, 2);
+  assert.equal(removedScopeOption.body.error.code, "INVALID_USAGE");
 });
 
 async function test(name: string, operation: () => Promise<void>): Promise<void> {

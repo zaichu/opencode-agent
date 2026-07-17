@@ -32,19 +32,32 @@ try {
 }
 
 function errorBody(error: unknown): ErrorBody {
-  if (error instanceof RuntimeError) return error.toJSON();
+  if (error instanceof RuntimeError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.retryable ? { retryable: true as const } : {}),
+    };
+  }
   if (error instanceof ConfigError) {
-    return { code: error.code, message: error.message, retryable: error.retryable };
+    return { code: error.code, message: error.message };
   }
   return {
     code: "INTERNAL_ERROR",
     message: error instanceof Error ? error.message : String(error),
-    retryable: false,
   };
 }
 
 function exitCode(code: string): number {
-  if (code === "INVALID_USAGE" || code === "INVALID_DIRECTORY" || code === "INVALID_ID" || code === "INVALID_CONFIG") return 2;
+  if (
+    code === "INVALID_USAGE" ||
+    code === "INVALID_DIRECTORY" ||
+    code === "INVALID_ID" ||
+    code === "INVALID_CONFIG" ||
+    code === "PROMPT_FILE_NOT_FOUND"
+  ) {
+    return 2;
+  }
   if (code === "WORKER_NOT_FOUND" || code === "WORKER_CLOSED") return 3;
   if (code === "TURN_NOT_FOUND") return 4;
   if (code === "DAEMON_UNAVAILABLE" || code === "DAEMON_VERSION_MISMATCH") return 7;

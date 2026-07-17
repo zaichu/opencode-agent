@@ -2,7 +2,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
 export const VERSION = "0.1.0";
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 1.2;
 export const PROTOCOL_HEADER = "x-opencode-agent-protocol";
 
 export interface AdapterConfig {
@@ -16,7 +16,6 @@ export interface AdapterConfig {
 
 export class ConfigError extends Error {
   readonly code = "INVALID_CONFIG";
-  readonly retryable = false;
 }
 
 export function loadConfig(): AdapterConfig {
