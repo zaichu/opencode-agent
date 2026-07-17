@@ -5,15 +5,17 @@ description: Delegate repository work to persistent OpenCode workers through the
 
 # Use OpenCode Agent
 
-Use `opencode-agent` as a persistent subagent. Let the parent agent delegate, inspect the result, and send follow-ups.
+Use `opencode-agent` as a persistent subagent. Keep the parent agent responsible for task scope, validation, and acceptance.
 
 ## Workflow
 
 1. Spawn a worker with a bounded task and completion criteria:
 
    ```text
-   opencode-agent spawn "Inspect the parser for correctness bugs and report evidence."
+   opencode-agent spawn --dir <repo> "Inspect the parser for correctness bugs and report evidence."
    ```
+
+   For substantial prompts, use `--file <path>` or `--stdin`.
 
 2. Retain both returned IDs:
 
@@ -23,6 +25,8 @@ Use `opencode-agent` as a persistent subagent. Let the parent agent delegate, in
 
    Use the Worker ID for the persistent conversation. Use the Turn ID for one task execution.
 
+   Validate that `workerId` begins with `wrk_`, `turnId` begins with `trn_`, and `status` is `"running"` before tracking the turn. Do not invent missing IDs.
+
 3. Check without blocking, or wait for completion:
 
    ```text
@@ -30,13 +34,15 @@ Use `opencode-agent` as a persistent subagent. Let the parent agent delegate, in
    opencode-agent wait trn_...
    ```
 
-   Prefer `status` for long-running work. Use `wait` when blocking is safe.
+   Prefer polling `status` for long work so the parent remains responsive and can interrupt the worker. Use `wait` when blocking is acceptable.
 
 4. Continue the same worker and retain the new Turn ID:
 
    ```text
    opencode-agent followup wrk_... "Implement the highest-severity fix and run its tests."
    ```
+
+   After `followup`, require valid Worker and Turn IDs and accept `status: "queued"` or `"running"` before tracking the new turn. Turns within one worker run FIFO.
 
 5. Stop active work or end the worker:
 
@@ -47,25 +53,14 @@ Use `opencode-agent` as a persistent subagent. Let the parent agent delegate, in
 
 ## Rules
 
-- Manage workers by ID, not label; labels may be duplicated.
-- Keep the same project scope across commands. Project scope is the default; use `--scope global` consistently when global state is required.
-- Use `--dir <path>` to control the worker's working directory.
-- Omit `--agent` and `--model` to use the existing OpenCode defaults. Set them only when the task needs a particular OpenCode agent or cheaper model.
-- Use `--file <path>` or `--stdin` for prompts that are awkward to quote.
-- Parse stdout as JSON. Errors are JSON on stderr with a nonzero exit code. Use `--text` only when machine-readable output is unnecessary.
-- There is no `result` command. Read completed output with `status <turn-id>` or `wait <turn-id>`.
-- Workers run concurrently; turns within one worker run FIFO.
-- Give concurrent write-capable workers separate Git worktrees when their file ownership may overlap.
-- Close workers when no further follow-up is needed.
-
-## Delegation pattern
-
-```text
-spawn(task)                 -> Worker ID + Turn ID
-status(turnId)              -> nonblocking state or result
-wait(turnId)                -> blocking final result
-followup(workerId, message) -> new Turn ID
-interrupt(workerId)         -> stop the active turn
-close(workerId)             -> end the persistent worker
-list()                      -> workers in the selected scope
-```
+* Manage workers by ID, not label; labels may be duplicated.
+* Keep the same registry scope across commands. Set `--dir` when spawning; the worker retains it. Use `--scope global` consistently when global state is required.
+* Omit `--agent` and `--model` to use the existing OpenCode defaults. Set them only when the task requires a particular agent or model.
+* Parse stdout as JSON. Errors are JSON on stderr with a nonzero exit code. Retry only when `error.retryable` is `true`.
+* There is no `result` command. Read completed output with `status <turn-id>` or `wait <turn-id>`.
+* After a caller timeout, check the existing Turn ID with `status`; do not spawn a duplicate worker.
+* Send a focused follow-up when work is incomplete or validation fails.
+* Inspect unexpected file changes and never discard unknown changes automatically.
+* Independently inspect changes and run relevant validation before accepting write-capable work.
+* Give concurrent write-capable workers separate Git worktrees when their file ownership may overlap.
+* Close workers when no further follow-up is needed.
