@@ -52,7 +52,11 @@ class OpenCodeClient {
 
   async health(): Promise<boolean> {
     try {
-      const response = await fetch(new URL("/global/health", this.baseUrl));
+      // listen していないポートへの接続が RST を返さずハングする環境があるため timeout 必須。
+      // ここが固まると ensureServer がサーバ起動の判断へ進めなくなる。
+      const response = await fetch(new URL("/global/health", this.baseUrl), {
+        signal: AbortSignal.timeout(2_000),
+      });
       if (!response.ok) return false;
       return ((await response.json()) as { healthy?: unknown }).healthy === true;
     } catch {

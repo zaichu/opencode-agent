@@ -7,6 +7,11 @@ import type { CommandRequest, ErrorBody } from "./protocol.ts";
 import { RuntimeError } from "./runtime.ts";
 import { daemonToken, resolveProject } from "./scope.ts";
 
+// listen していないポートへの TCP 接続が RST を返さずハングする環境があるため、
+// daemon の疎通確認には必ず timeout を掛ける(実コマンドの送信には掛けない)。
+const DAEMON_PROBE_TIMEOUT_MS = 2_000;
+const DAEMON_STARTUP_PROBE_TIMEOUT_MS = 500;
+
 interface ParsedArgs {
   options: Map<string, string>;
   flags: Set<string>;
@@ -92,11 +97,13 @@ async function makeRequest(
 
 async function callDaemon(command: CommandRequest, config: AdapterConfig): Promise<unknown> {
   const token = await daemonToken(config.dataRoot);
-  let response = await daemonFetch(command, token, config).catch(() => undefined);
-  if (!response) {
+  // 先に /health で疎通を確かめてから本コマンドを送る。
+  // コマンドを投機的に送って失敗時に再送する形にすると、送信が実際には届いていた場合に
+  // 同じ spawn が二重実行されうる。/health は冪等なので安全に短い timeout を掛けられる。
+  if (!(await daemonHealthy(config))) {
     await startDaemon(config);
-    response = await daemonFetch(command, token, config);
   }
+  const response = await daemonFetch(command, token, config);
 
   assertProtocol(response);
   const body = (await response.json()) as { error?: unknown };
@@ -109,6 +116,24 @@ async function callDaemon(command: CommandRequest, config: AdapterConfig): Promi
     );
   }
   return body;
+}
+
+// daemon が起きているかの確認。listen していないポートへの接続が RST を返さず
+// ハングする環境(WSL2 の networkingMode=mirrored など)があるため、必ず timeout を掛ける。
+// timeout が無いと fetch が例外を投げず、daemon 起動フローへ進めないまま固まる。
+async function daemonHealthy(config: AdapterConfig): Promise<boolean> {
+  let response: Response;
+  try {
+    response = await fetch(`${config.daemonUrl}/health`, {
+      signal: AbortSignal.timeout(DAEMON_PROBE_TIMEOUT_MS),
+    });
+  } catch {
+    return false;
+  }
+  assertProtocol(response);
+  if (!response.ok) return false;
+  const health = (await response.json()) as { name?: unknown; protocol?: unknown };
+  return health.name === "opencode-agent" && health.protocol === PROTOCOL_VERSION;
 }
 
 function daemonFetch(command: CommandRequest, token: string, config: AdapterConfig): Promise<Response> {
@@ -139,7 +164,10 @@ async function startDaemon(config: AdapterConfig): Promise<void> {
 
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      const response = await fetch(`${config.daemonUrl}/health`);
+      // 起動待ちの間はまだ listen していないため、timeout 無しだとハングする環境がある。
+      const response = await fetch(`${config.daemonUrl}/health`, {
+        signal: AbortSignal.timeout(DAEMON_STARTUP_PROBE_TIMEOUT_MS),
+      });
       assertProtocol(response);
       const health = (await response.json()) as {
         name?: unknown;
