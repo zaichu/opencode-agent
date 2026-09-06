@@ -227,3 +227,63 @@ test("malformed OpenCode responses fail at the adapter seam", async () => {
     openCode.stop();
   }
 });
+
+test("a turn that reports no progress for turnTimeoutMs is failed as a timeout", async () => {
+  // 上流(OpenCode本体)がレート制限等のリトライ失敗後、SSE で何のイベントも送出
+  // せず無応答のまま固まるケースを再現する。onPrompt が何もしないことで、
+  // busy/idle/error のいずれのイベントも来ない状況を作る。
+  const openCode = startFakeOpenCode({
+    onPrompt() {
+      // 意図的に何もしない: セッションは busy にも idle にもならない。
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 50, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await expect(
+      client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_77777777777777777777777777777777",
+        { message: "this will never receive a progress event" },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: "OPENCODE_TURN_TIMEOUT", retryable: true });
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("progress events (busy) postpone the timeout", async () => {
+  // busy イベントで lastActivityAt が更新される限りタイムアウトしないことを
+  // 確認する。turnTimeoutMs(60ms) の合計より長い期間 busy を送り続けても
+  // タイムアウトせず、最後に完了すれば正常に resolve することを検証する。
+  const openCode = startFakeOpenCode({
+    async onPrompt(context) {
+      context.session.status = "busy";
+      context.addUser();
+      for (let i = 0; i < 5; i++) {
+        await Bun.sleep(20);
+        context.emit("session.status", { sessionID: context.session.id, status: { type: "busy" } });
+      }
+      const assistant = context.addAssistant({ text: "finished after being kept alive" });
+      context.complete(assistant);
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 60, 15);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const result = await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_88888888888888888888888888888888",
+      { message: "keep alive via busy events" },
+      new AbortController().signal,
+    );
+    expect(result).toBe("finished after being kept alive");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});

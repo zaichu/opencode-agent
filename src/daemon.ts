@@ -16,7 +16,7 @@ export async function runDaemon(config: AdapterConfig): Promise<void> {
   await mkdir(config.dataRoot, { recursive: true, mode: 0o700 });
   const lock = await acquireDaemonLock(config);
   const token = await daemonToken(config.dataRoot);
-  const openCode = new ManagedOpenCode(config.openCodeUrl, config.openCodeBinary);
+  const openCode = new ManagedOpenCode(config.openCodeUrl, config.openCodeBinary, config.turnTimeoutMs);
   const runtime = createWorkerRuntime({
     client: openCode,
     stateFile: await stateFileFor(config.dataRoot),

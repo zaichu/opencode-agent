@@ -35,6 +35,11 @@ interface PendingTurn {
   readonly failIfIdleWithoutResult: boolean;
   finishing: boolean;
   abortListener(): void;
+  // 最後に何らかの進捗(SSEイベント受信)があった時刻。上流(OpenCode本体)が
+  // リトライ上限に達した後どのイベントも送出せず無応答のまま固まることがあり
+  // (例: レート制限。stream error はサーバー内部ログにのみ残り SSE には来ない)、
+  // その場合でも一定時間で確実に failed へ倒すためのタイムアウト判定に使う。
+  lastActivityAt: number;
 }
 
 class OpenCodeFailure extends Error {
@@ -216,6 +221,9 @@ class OpenCodeClient {
   }
 }
 
+const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
+const TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000;
+
 export class ManagedOpenCode implements OpenCodePort {
   private readonly client: OpenCodeClient;
   private readonly eventAbort = new AbortController();
@@ -225,12 +233,43 @@ export class ManagedOpenCode implements OpenCodePort {
   private eventsReady?: Promise<void>;
   private reconnecting?: Promise<void>;
   private stopped = false;
+  private readonly timeoutTimer: ReturnType<typeof setInterval>;
 
   constructor(
     private readonly baseUrl = "http://127.0.0.1:4096",
     private readonly executable = "opencode",
+    private readonly turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS,
+    // 本番では変更不要。短い turnTimeoutMs でのテストのためだけに存在する。
+    timeoutCheckIntervalMs = TIMEOUT_CHECK_INTERVAL_MS,
   ) {
     this.client = new OpenCodeClient(baseUrl);
+    this.timeoutTimer = setInterval(() => this.checkTimeouts(), timeoutCheckIntervalMs);
+    this.timeoutTimer.unref?.();
+  }
+
+  // 進捗があったことを記録する。observed フラグを立てる全箇所はここを通すこと
+  // (lastActivityAt を更新し忘れるとタイムアウト検出が効かなくなる)。
+  private markObserved(pending: PendingTurn): void {
+    pending.observed = true;
+    pending.lastActivityAt = Date.now();
+  }
+
+  // 進捗イベントが turnTimeoutMs より前から無い pending turn を強制的に失敗させる。
+  // 上流(OpenCode本体)がリトライ失敗後に何も通知してこない場合の最後の砦。
+  private checkTimeouts(): void {
+    const now = Date.now();
+    for (const pending of [...this.pending.values()]) {
+      if (now - pending.lastActivityAt < this.turnTimeoutMs) continue;
+      this.rejectPending(
+        pending,
+        new OpenCodeFailure(
+          "OPENCODE_TURN_TIMEOUT",
+          `OpenCode session ${pending.sessionId} produced no progress for ${Math.round(this.turnTimeoutMs / 1000)}s ` +
+            "(possible provider rate limit or upstream failure that OpenCode did not report over SSE).",
+          true,
+        ),
+      );
+    }
   }
 
   async createSession(input: { directory: string; label?: string }): Promise<string> {
@@ -250,7 +289,7 @@ export class ManagedOpenCode implements OpenCodePort {
     if (existing && isTerminalMessage(existing.info)) return resultText(existing);
     const persisted = Boolean(existing) || (await this.client.hasUserMessage(sessionId, directory, messageId));
     const pending = this.watch(sessionId, directory, messageId, signal, persisted);
-    if (existing) pending.observed = true;
+    if (existing) this.markObserved(pending);
     try {
       if (!persisted) await this.client.promptAsync(sessionId, directory, messageId, input);
       await this.refresh(pending);
@@ -273,6 +312,7 @@ export class ManagedOpenCode implements OpenCodePort {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    clearInterval(this.timeoutTimer);
     this.eventAbort.abort();
     for (const pending of this.pending.values()) {
       pending.reject(new OpenCodeFailure("OPENCODE_STOPPED", "The OpenCode host stopped.", true));
@@ -478,7 +518,7 @@ export class ManagedOpenCode implements OpenCodePort {
           message.parentID === pending.userMessageId &&
           typeof message.id === "string"
         ) {
-          pending.observed = true;
+          this.markObserved(pending);
           if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
           else if (isTerminalMessage(message)) void this.finish(sessionId);
         }
@@ -496,7 +536,7 @@ export class ManagedOpenCode implements OpenCodePort {
           const pending = this.pending.get(properties.sessionID);
           if (!pending) break;
           const type = (status as { type?: unknown }).type;
-          if (type === "busy" || type === "retry") pending.observed = true;
+          if (type === "busy" || type === "retry") this.markObserved(pending);
           else if (type === "idle") void this.refresh(pending);
         }
         break;
@@ -533,6 +573,7 @@ export class ManagedOpenCode implements OpenCodePort {
       observed: false,
       failIfIdleWithoutResult,
       finishing: false,
+      lastActivityAt: Date.now(),
       abortListener: () => {
         this.rejectPending(
           pending,
@@ -555,7 +596,7 @@ export class ManagedOpenCode implements OpenCodePort {
     );
     if (this.pending.get(pending.sessionId) !== pending) return;
     if (assistant) {
-      pending.observed = true;
+      this.markObserved(pending);
       if (assistant.info.error) {
         this.rejectPending(pending, errorFromAssistant(assistant.info.error));
         return;
@@ -567,7 +608,7 @@ export class ManagedOpenCode implements OpenCodePort {
     }
     const status = await this.client.sessionStatus(pending.sessionId, pending.directory);
     if (status === "busy" || status === "retry") {
-      pending.observed = true;
+      this.markObserved(pending);
     } else if (pending.observed || pending.failIfIdleWithoutResult) {
       await this.finish(pending.sessionId);
     }

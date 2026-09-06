@@ -12,6 +12,7 @@ export interface AdapterConfig {
   openCodeUrl: string;
   openCodeBinary: string;
   maxRequestBytes: number;
+  turnTimeoutMs: number;
 }
 
 export class ConfigError extends Error {
@@ -31,6 +32,16 @@ export function loadConfig(): AdapterConfig {
       Bun.env.OPENCODE_AGENT_MAX_REQUEST_BYTES ?? String(16 * 1024 * 1024),
       1024,
       1024 * 1024 * 1024,
+    ),
+    // OpenCode 本体がプロバイダのレート制限等でリトライに失敗した後、SSE で
+    // 何のイベントも送出せず turn が無応答のまま固まることがある(サーバー内部
+    // ログにのみ "stream error" が残り、message.updated / session.error は来ない)。
+    // これを検出するため、進捗イベントが一定時間無ければ強制的に failed にする。
+    turnTimeoutMs: integerSetting(
+      "OPENCODE_AGENT_TURN_TIMEOUT_MS",
+      Bun.env.OPENCODE_AGENT_TURN_TIMEOUT_MS ?? String(5 * 60 * 1000),
+      1000,
+      60 * 60 * 1000,
     ),
   };
 }
