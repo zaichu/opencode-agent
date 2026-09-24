@@ -755,6 +755,85 @@ test("completed turn descendants do not attach to a follow-up turn", async () =>
   }
 });
 
+test("completed turn mappings and late SSE stay out of the next turn", async () => {
+  let openCode!: FakeOpenCode;
+  let secondContext: PromptContext | undefined;
+  let childId = "late-child";
+  openCode = startFakeOpenCode({
+    async onPrompt(context) {
+      context.session.status = "busy";
+      context.addUser();
+      if (context.prompt === "turn A") {
+        openCode.session(childId, process.cwd(), context.session.id);
+        await Bun.sleep(20);
+        const assistant = context.addAssistant({ text: "turn A complete" });
+        context.complete(assistant);
+      } else {
+        secondContext = context;
+      }
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
+  const mappings = client as unknown as {
+    sessionTurns: Map<string, string>;
+    sessionParents: Map<string, string>;
+  };
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_00000000000000000000000000000013",
+      { message: "turn A" },
+      new AbortController().signal,
+      "turn-A",
+    );
+    expect(mappings.sessionTurns.size).toBe(0);
+    expect(mappings.sessionParents.size).toBe(0);
+
+    const second = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_00000000000000000000000000000014",
+      { message: "turn B" },
+      new AbortController().signal,
+      "turn-B",
+    );
+    second.catch(() => {});
+    await Bun.sleep(30);
+    if (!secondContext) throw new Error("turn B did not start");
+    const before = await client.turnProgress("turn-B", session, process.cwd());
+    if (!before) throw new Error("turn B progress was unavailable");
+
+    openCode.emit("message.part.updated", {
+      sessionID: childId,
+      time: Date.now(),
+      part: {
+        id: "late-part",
+        messageID: "late-message",
+        sessionID: childId,
+        type: "step-start",
+      },
+    });
+    openCode.emit("session.status", { sessionID: childId, status: { type: "busy" } });
+    await Bun.sleep(20);
+
+    const after = await client.turnProgress("turn-B", session, process.cwd());
+    expect(after?.lastActivityAt).toBe(before.lastActivityAt);
+    expect(after?.steps).toBe(before.steps);
+    expect(after?.activeSubagents).toBe(before.activeSubagents);
+    expect(after?.steps).toBe(0);
+    expect(after?.activeSubagents).toBe(0);
+
+    const assistant = secondContext.addAssistant({ text: "turn B complete" });
+    secondContext.complete(assistant);
+    await expect(second).resolves.toBe("turn B complete");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
 test("inactive descendants leave activeSubagents after the idle grace period", async () => {
   let openCode!: FakeOpenCode;
   openCode = startFakeOpenCode({
