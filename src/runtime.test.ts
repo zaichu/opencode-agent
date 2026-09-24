@@ -141,7 +141,31 @@ test("workers run concurrently without an adapter limit while each worker stays 
   ]);
 });
 
+test("turn status exposes subagent progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-agent-progress-"));
+  temporaryDirectories.push(directory);
+  const client = new FakeOpenCode();
+  client.progress = {
+    steps: 3,
+    activeSubagents: 2,
+    lastActivityAt: Date.now(),
+    lastTool: "bash",
+  };
+  const runtime = createWorkerRuntime({ client, stateFile: join(directory, "state.sqlite") });
+  runtimes.push(runtime);
+
+  const spawned = await runtime.spawn({ task: "slow task", projectRoot: directory });
+  const snapshot = await runtime.status(spawned.turnId);
+  expect(snapshot).toMatchObject({
+    type: "turn",
+    status: "running",
+    progress: { steps: 3, activeSubagents: 2, lastTool: "bash" },
+  });
+  await runtime.interrupt(spawned.workerId);
+});
+
 class FakeOpenCode implements OpenCodePort {
+  progress?: { steps: number; activeSubagents: number; lastActivityAt: number; lastTool?: string };
   private nextSession = 0;
   private active = 0;
   readonly started: string[] = [];
@@ -178,6 +202,12 @@ class FakeOpenCode implements OpenCodePort {
   async abort(): Promise<void> {}
 
   async close(): Promise<void> {}
+
+  async turnProgress(): Promise<
+    { steps: number; activeSubagents: number; lastActivityAt: number; lastTool?: string } | undefined
+  > {
+    return this.progress;
+  }
 }
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {

@@ -255,6 +255,137 @@ test("a turn that reports no progress for turnTimeoutMs is failed as a timeout",
   }
 });
 
+test("child-only activity postpones the timeout", async () => {
+  // 親の SSE には何も流れないが、子セッションだけが動き続けるケース。
+  // 30秒検査(ここでは短縮)が子孫の Session.time.updated を見て
+  // lastActivityAt を更新し続ける限りタイムアウトしないことを検証する。
+  let parentId = "";
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      parentId = context.session.id;
+      context.session.status = "idle";
+      context.addUser();
+      // 親は SSE で何も送らない: busy にも idle にも complete にもしない。
+      void (async () => {
+        for (let i = 0; i < 6; i++) {
+          await Bun.sleep(20);
+          const child = openCode.session(`child-active-${i}`, process.cwd(), parentId);
+          child.messages.push({
+            info: {
+              id: `child-assistant-${i}`,
+              sessionID: child.id,
+              role: "assistant",
+              time: { created: Date.now() },
+            },
+            parts: [{ type: "tool", tool: "bash" }],
+          });
+          openCode.touch(child.id);
+        }
+        await Bun.sleep(10);
+        const assistant = context.addAssistant({ text: "parent done after children" });
+        context.complete(assistant);
+      })();
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 80, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const result = await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_99999999999999999999999999999991",
+      { message: "delegate to subagents" },
+      new AbortController().signal,
+    );
+    expect(result).toBe("parent done after children");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("stalled children still time out", async () => {
+  // 子が一度だけ動いて止まり、親も何も送らなければタイムアウトすることを検証する。
+  let parentId = "";
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      parentId = context.session.id;
+      context.session.status = "idle";
+      context.addUser();
+      const child = openCode.session("child-stalled", process.cwd(), parentId);
+      child.messages.push({
+        info: {
+          id: "child-assistant-once",
+          sessionID: child.id,
+          role: "assistant",
+          time: { created: Date.now() },
+        },
+        parts: [{ type: "text", text: "one step" }],
+      });
+      openCode.touch(child.id);
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 60, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await expect(
+      client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_99999999999999999999999999999992",
+        { message: "children stall" },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: "OPENCODE_TURN_TIMEOUT", retryable: true });
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("turn progress summarizes subagent activity", async () => {
+  let parentId = "";
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      parentId = context.session.id;
+      context.session.status = "idle";
+      context.addUser();
+      const child = openCode.session("child-progress", process.cwd(), parentId);
+      child.messages.push({
+        info: {
+          id: "child-assistant-progress",
+          sessionID: child.id,
+          role: "assistant",
+          time: { created: Date.now() },
+        },
+        parts: [{ type: "tool", tool: "bash" }],
+      });
+      openCode.touch(child.id);
+      // turn は終わらせない。progress だけを検査する。
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const pending = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_99999999999999999999999999999993",
+      { message: "check progress" },
+      new AbortController().signal,
+    );
+    pending.catch(() => {});
+    await Bun.sleep(80);
+    const progress = await client.turnProgress(session, process.cwd());
+    expect(progress).toMatchObject({ activeSubagents: 1, lastTool: "bash" });
+    expect(progress?.steps).toBeGreaterThanOrEqual(1);
+    expect(progress?.lastActivityAt).toBeGreaterThan(0);
+    await client.stop();
+    await expect(pending).rejects.toMatchObject({ code: "OPENCODE_STOPPED" });
+  } finally {
+    openCode.stop();
+  }
+});
 test("progress events (busy) postpone the timeout", async () => {
   // busy イベントで lastActivityAt が更新される限りタイムアウトしないことを
   // 確認する。turnTimeoutMs(60ms) の合計より長い期間 busy を送り続けても

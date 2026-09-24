@@ -8,6 +8,8 @@ export interface FakeSession {
   directory: string;
   status: "idle" | "busy" | "retry";
   messages: FakeMessage[];
+  parentID?: string;
+  updatedAt: number;
 }
 
 export interface PromptContext {
@@ -38,7 +40,8 @@ export interface FakeOpenCode {
   readonly url: string;
   readonly approvals: string[];
   readonly submissions: number;
-  session(id: string, directory?: string): FakeSession;
+  session(id: string, directory?: string, parentID?: string): FakeSession;
+  touch(id: string): FakeSession;
   stop(): void;
 }
 
@@ -85,11 +88,27 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
       if (request.method === "POST" && url.pathname === "/session") {
         const id = `session-${++nextSession}`;
         const directory = url.searchParams.get("directory") ?? "";
-        sessions.set(id, { id, directory, status: "idle", messages: [] });
+        sessions.set(id, { id, directory, status: "idle", messages: [], updatedAt: Date.now() });
         return Response.json({ id, directory });
       }
       if (request.method === "GET" && (url.pathname === "/permission" || url.pathname === "/question")) {
         return Response.json([]);
+      }
+      const childrenMatch = url.pathname.match(/^\/session\/([^/]+)\/children$/);
+      if (request.method === "GET" && childrenMatch) {
+        const parentId = decodeURIComponent(childrenMatch[1]!);
+        const directory = url.searchParams.get("directory") ?? "";
+        const children = [...sessions.values()].filter(
+          (session) => session.parentID === parentId && (!directory || session.directory === directory),
+        );
+        return Response.json(children.map(toSessionPayload));
+      }
+      if (request.method === "GET" && url.pathname === "/session") {
+        const directory = url.searchParams.get("directory") ?? "";
+        const listed = [...sessions.values()].filter(
+          (session) => !directory || session.directory === directory,
+        );
+        return Response.json(listed.map(toSessionPayload));
       }
       if (request.method === "GET" && url.pathname === "/session/status") {
         return Response.json(
@@ -149,13 +168,31 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     },
   });
 
-  function session(id: string, directory = process.cwd()): FakeSession {
+  function session(id: string, directory = process.cwd(), parentID?: string): FakeSession {
     let value = sessions.get(id);
     if (!value) {
-      value = { id, directory, status: "idle", messages: [] };
+      value = { id, directory, status: "idle", messages: [], parentID, updatedAt: Date.now() };
       sessions.set(id, value);
+    } else if (parentID !== undefined) {
+      value.parentID = parentID;
     }
     return value;
+  }
+
+  function touch(id: string): FakeSession {
+    const value = sessions.get(id);
+    if (!value) throw new Error(`Unknown fake session ${id}.`);
+    value.updatedAt = Date.now();
+    return value;
+  }
+
+  function toSessionPayload(session: FakeSession): Record<string, unknown> {
+    return {
+      id: session.id,
+      parentID: session.parentID,
+      directory: session.directory,
+      time: { created: session.updatedAt, updated: session.updatedAt },
+    };
   }
 
   function promptContext(current: FakeSession, messageId: string, prompt: string): PromptContext {
@@ -169,6 +206,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
           parts: [{ type: "text", text: prompt }],
         };
         current.messages.push(message);
+        current.updatedAt = Date.now();
         emit("message.updated", { info: message.info });
         return message;
       },
@@ -187,6 +225,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
           parts: input.parts ?? (input.text === undefined ? [] : [{ type: "text", text: input.text }]),
         };
         current.messages.push(message);
+        current.updatedAt = Date.now();
         return message;
       },
       emit,
@@ -197,6 +236,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
         message.info.time.completed = Date.now();
         message.info.finish ??= "stop";
         current.status = "idle";
+        current.updatedAt = Date.now();
         emit("message.updated", { info: message.info });
         if (emitIdle) emit("session.idle", { sessionID: current.id });
       },
@@ -231,6 +271,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     approvals,
     get submissions() { return submissions; },
     session,
+    touch,
     stop() { server.stop(true); },
   };
 }
