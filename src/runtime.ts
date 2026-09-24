@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import type { OpenCodePort } from "./opencode.ts";
+import type { OpenCodePort, TurnProgress } from "./opencode.ts";
 import { Registry, RegistryError, type TurnRecord, type WorkerRecord } from "./registry.ts";
 import { WorktreeError, type WorktreeInfo, type WorktreePort } from "./worktree.ts";
 
@@ -60,6 +60,7 @@ export interface TurnSnapshot {
   status: TurnState;
   text?: string;
   error?: RuntimeErrorBody;
+  progress?: TurnProgress;
 }
 
 export type TerminalTurnSnapshot = TurnSnapshot & {
@@ -241,7 +242,7 @@ export function createWorkerRuntime(input: {
     async status(id) {
       await ready;
       if (id.startsWith("wrk_")) return workerSnapshot(requiredWorker(id as WorkerId));
-      if (id.startsWith("trn_")) return turnSnapshot(requiredTurn(id as TurnId));
+      if (id.startsWith("trn_")) return turnSnapshot(requiredTurn(id as TurnId), await progressOf(id as TurnId));
       throw new RuntimeError("INVALID_ID", `Expected a wrk_... or trn_... ID; received ${id}.`);
     },
 
@@ -416,9 +417,26 @@ export function createWorkerRuntime(input: {
     latches.delete(turnId);
     latch.resolve();
   }
+
+  // 実行中の turn にだけ進捗要約を付ける。完了・失敗・中断済みは付けない。
+  // client が turnProgress に対応していなければ undefined のまま返す。
+  async function progressOf(turnId: TurnId): Promise<TurnProgress | undefined> {
+    if (!input.client.turnProgress) return undefined;
+    const turn = registry.getTurn(turnId);
+    if (!turn || turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed") {
+      return undefined;
+    }
+    const worker = registry.getWorker(turn.workerId);
+    if (!worker) return undefined;
+    try {
+      return await input.client.turnProgress(worker.sessionId, worker.directory);
+    } catch {
+      return undefined;
+    }
+  }
 }
 
-function turnSnapshot(turn: TurnRecord): TurnSnapshot {
+function turnSnapshot(turn: TurnRecord, progress?: TurnProgress): TurnSnapshot {
   return {
     type: "turn" as const,
     turnId: turn.id,
@@ -426,6 +444,7 @@ function turnSnapshot(turn: TurnRecord): TurnSnapshot {
     status: turn.status,
     text: turn.text,
     error: turn.error,
+    ...(progress === undefined ? {} : { progress }),
   };
 }
 

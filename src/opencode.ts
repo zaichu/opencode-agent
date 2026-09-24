@@ -1,3 +1,16 @@
+export interface TurnProgress {
+  steps: number;
+  activeSubagents: number;
+  lastActivityAt: number;
+  lastTool?: string;
+}
+
+interface SessionInfo {
+  id: string;
+  parentID?: string;
+  updatedAt: number;
+}
+
 export interface OpenCodePort {
   createSession(input: { directory: string; label?: string }): Promise<string>;
   executeTurn(
@@ -9,6 +22,7 @@ export interface OpenCodePort {
   ): Promise<string>;
   abort(sessionId: string, directory: string): Promise<void>;
   close(sessionId: string, directory: string): Promise<void>;
+  turnProgress?(sessionId: string, directory: string): Promise<TurnProgress | undefined>;
 }
 
 interface MessageEnvelope {
@@ -20,7 +34,7 @@ interface MessageEnvelope {
     finish?: string;
     error?: unknown;
   };
-  parts: Array<{ type?: string; text?: string }>;
+  parts: Array<{ type?: string; text?: string; tool?: string }>;
 }
 
 interface PendingTurn {
@@ -40,6 +54,11 @@ interface PendingTurn {
   // (例: レート制限。stream error はサーバー内部ログにのみ残り SSE には来ない)、
   // その場合でも一定時間で確実に failed へ倒すためのタイムアウト判定に使う。
   lastActivityAt: number;
+  // 子孫セッションの Session.time.updated の最大値(前回ポーリング時)。
+  // 変化が無ければ messages API を叩かず何もしないための比較基準。
+  childUpdatedAt: number;
+  // 子孫活動から集約した最新の進捗要約。turnProgress() で公開する。
+  progress?: TurnProgress;
 }
 
 class OpenCodeFailure extends Error {
@@ -116,8 +135,19 @@ class OpenCodeClient {
     return status;
   }
 
-  async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
-    const messages = await this.messages(sessionId, directory);
+  async listSessions(directory: string): Promise<SessionInfo[]> {
+    const response = await this.request(this.directoryUrl("/session", directory));
+    return sessionList(await response.json());
+  }
+
+  async sessionChildren(sessionId: string, directory: string): Promise<SessionInfo[]> {
+    const response = await this.request(
+      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/children`, directory),
+    );
+    return sessionList(await response.json());
+  }
+
+  async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {    const messages = await this.messages(sessionId, directory);
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index]!;
       if (message.info.role === "assistant" && message.info.parentID === userMessageId) return message;
@@ -213,7 +243,7 @@ class OpenCodeClient {
     return url;
   }
 
-  private async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
+  async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
     const response = await this.request(
       this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
     );
@@ -243,7 +273,9 @@ export class ManagedOpenCode implements OpenCodePort {
     timeoutCheckIntervalMs = TIMEOUT_CHECK_INTERVAL_MS,
   ) {
     this.client = new OpenCodeClient(baseUrl);
-    this.timeoutTimer = setInterval(() => this.checkTimeouts(), timeoutCheckIntervalMs);
+    this.timeoutTimer = setInterval(() => {
+      void this.checkTimeouts().catch(() => {});
+    }, timeoutCheckIntervalMs);
     this.timeoutTimer.unref?.();
   }
 
@@ -256,9 +288,17 @@ export class ManagedOpenCode implements OpenCodePort {
 
   // 進捗イベントが turnTimeoutMs より前から無い pending turn を強制的に失敗させる。
   // 上流(OpenCode本体)がリトライ失敗後に何も通知してこない場合の最後の砦。
-  private checkTimeouts(): void {
-    const now = Date.now();
+  // 子セッション(サブエージェント)の活動も進捗とみなすため、先に子孫を
+  // ポーリングして変化があれば lastActivityAt を更新してから判定する。
+  private async checkTimeouts(): Promise<void> {
     for (const pending of [...this.pending.values()]) {
+      try {
+        await this.pollSubagentActivity(pending);
+      } catch {
+        // 子孫の取得失敗はタイムアウト判定に影響させない(親の判定を優先)。
+      }
+      if (this.pending.get(pending.sessionId) !== pending) continue;
+      const now = Date.now();
       if (now - pending.lastActivityAt < this.turnTimeoutMs) continue;
       this.rejectPending(
         pending,
@@ -275,6 +315,124 @@ export class ManagedOpenCode implements OpenCodePort {
   async createSession(input: { directory: string; label?: string }): Promise<string> {
     await this.ensureRunning();
     return this.client.createSession(input);
+  }
+
+  // turn の進捗要約(steps / active_subagents / last_activity_at / last_tool)を返す。
+  // runtime の status から参照される。pending が無ければ undefined。
+  async turnProgress(sessionId: string, directory: string): Promise<TurnProgress | undefined> {
+    const pending = this.pending.get(sessionId);
+    if (!pending || pending.directory !== directory) return undefined;
+    try {
+      const progress = await this.pollSubagentActivity(pending);
+      return progress ?? pending.progress;
+    } catch {
+      return pending.progress;
+    }
+  }
+
+  // 子孫セッションの活動を集約する。Session.time.updated の最大値が前回と
+  // 変わらなければ messages API を叩かずキャッシュを返す(API節約)。
+  // 変化があったときだけ messages を取得して steps/last_tool を集計し、
+  // markObserved で lastActivityAt を更新する。
+  private async pollSubagentActivity(pending: PendingTurn): Promise<TurnProgress | undefined> {
+    const descendants = await this.descendantSessions(pending.sessionId, pending.directory);
+    if (descendants.length === 0) return pending.progress;
+    const maxUpdated = descendants.reduce((max, session) => Math.max(max, session.updatedAt), 0);
+    if (maxUpdated <= pending.childUpdatedAt) return pending.progress;
+    const now = Date.now();
+    const activeSubagents = descendants.filter(
+      (session) => now - session.updatedAt < this.turnTimeoutMs,
+    ).length;
+    const { steps, lastTool, latestAt } = await this.summarizeMessages(
+      [pending.sessionId, ...descendants.map((session) => session.id)],
+      pending.directory,
+    );
+    const progress: TurnProgress = {
+      steps,
+      activeSubagents,
+      lastActivityAt: Math.max(maxUpdated, latestAt, pending.progress?.lastActivityAt ?? 0),
+      ...(lastTool === undefined ? {} : { lastTool }),
+    };
+    pending.childUpdatedAt = maxUpdated;
+    pending.progress = progress;
+    this.markObserved(pending);
+    return progress;
+  }
+
+  // GET /session 一覧から親子マップを作って子孫をたどる(呼び出し1回)。
+  // 一覧が使えなければ children API の再帰にフォールバックする。
+  private async descendantSessions(sessionId: string, directory: string): Promise<SessionInfo[]> {
+    try {
+      const sessions = await this.client.listSessions(directory);
+      const byParent = new Map<string, SessionInfo[]>();
+      for (const session of sessions) {
+        if (!session.parentID) continue;
+        const siblings = byParent.get(session.parentID) ?? [];
+        siblings.push(session);
+        byParent.set(session.parentID, siblings);
+      }
+      const descendants: SessionInfo[] = [];
+      const queue = [...(byParent.get(sessionId) ?? [])];
+      const seen = new Set<string>([sessionId]);
+      while (queue.length > 0) {
+        const next = queue.shift()!;
+        if (seen.has(next.id)) continue;
+        seen.add(next.id);
+        descendants.push(next);
+        queue.push(...(byParent.get(next.id) ?? []));
+      }
+      return descendants;
+    } catch {
+      return this.descendantSessionsViaChildren(sessionId, directory, 0);
+    }
+  }
+
+  private async descendantSessionsViaChildren(
+    sessionId: string,
+    directory: string,
+    depth: number,
+  ): Promise<SessionInfo[]> {
+    if (depth > 10) return [];
+    let children: SessionInfo[];
+    try {
+      children = await this.client.sessionChildren(sessionId, directory);
+    } catch {
+      return [];
+    }
+    const descendants = [...children];
+    for (const child of children) {
+      descendants.push(...(await this.descendantSessionsViaChildren(child.id, directory, depth + 1)));
+    }
+    return descendants;
+  }
+
+  private async summarizeMessages(
+    sessionIds: string[],
+    directory: string,
+  ): Promise<{ steps: number; lastTool?: string; latestAt: number }> {
+    let steps = 0;
+    let lastTool: string | undefined;
+    let latestAt = 0;
+    await Promise.all(
+      sessionIds.map(async (id) => {
+        let messages: MessageEnvelope[];
+        try {
+          messages = await this.client.messages(id, directory);
+        } catch {
+          return;
+        }
+        for (const message of messages) {
+          if (message.info.role !== "assistant") continue;
+          steps++;
+          const at = message.info.time?.completed ?? message.info.time?.created ?? 0;
+          if (typeof at === "number") latestAt = Math.max(latestAt, at);
+          for (const part of message.parts) {
+            if (typeof part.tool === "string" && part.tool) lastTool = part.tool;
+          }
+        }
+      }),
+    );
+    return { steps, ...(lastTool === undefined ? {} : { lastTool }), latestAt };
   }
 
   async executeTurn(
@@ -574,6 +732,7 @@ export class ManagedOpenCode implements OpenCodePort {
       failIfIdleWithoutResult,
       finishing: false,
       lastActivityAt: Date.now(),
+      childUpdatedAt: 0,
       abortListener: () => {
         this.rejectPending(
           pending,
@@ -797,19 +956,46 @@ function messageList(value: unknown): MessageEnvelope[] {
     }
     const parts = message.parts.map((part) => {
       if (!part || typeof part !== "object") invalidResponse("OpenCode returned an invalid message part.");
-      const value = part as { type?: unknown; text?: unknown };
+      const value = part as { type?: unknown; text?: unknown; tool?: unknown };
       if (value.type !== undefined && typeof value.type !== "string") {
         invalidResponse("OpenCode returned an invalid message part type.");
       }
       if (value.text !== undefined && typeof value.text !== "string") {
         invalidResponse("OpenCode returned invalid message text.");
       }
+      if (value.tool !== undefined && typeof value.tool !== "string") {
+        invalidResponse("OpenCode returned an invalid message part tool.");
+      }
       return {
         type: typeof value.type === "string" ? value.type : undefined,
         text: typeof value.text === "string" ? value.text : undefined,
+        tool: typeof value.tool === "string" ? value.tool : undefined,
       };
     });
     return { info: info as unknown as MessageEnvelope["info"], parts };
+  });
+}
+
+function sessionList(value: unknown): SessionInfo[] {
+  if (!Array.isArray(value)) invalidResponse("OpenCode returned an invalid session list.");
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid session.");
+    const session = entry as { id?: unknown; parentID?: unknown; time?: unknown };
+    if (typeof session.id !== "string") invalidResponse("OpenCode returned an invalid session ID.");
+    if (session.parentID !== undefined && typeof session.parentID !== "string") {
+      invalidResponse("OpenCode returned an invalid parent session ID.");
+    }
+    let updatedAt = 0;
+    if (session.time && typeof session.time === "object") {
+      const time = session.time as { updated?: unknown; created?: unknown };
+      if (typeof time.updated === "number") updatedAt = time.updated;
+      else if (typeof time.created === "number") updatedAt = time.created;
+    }
+    return {
+      id: session.id,
+      ...(typeof session.parentID === "string" ? { parentID: session.parentID } : {}),
+      updatedAt,
+    };
   });
 }
 
