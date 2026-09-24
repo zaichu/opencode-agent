@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OpenCodePort } from "./opencode.ts";
+import type { OpenCodePort, TurnProgress } from "./opencode.ts";
 import { createWorkerRuntime, type HostedWorkerRuntime } from "./runtime.ts";
 import type { WorktreePort } from "./worktree.ts";
 
@@ -141,7 +141,67 @@ test("workers run concurrently without an adapter limit while each worker stays 
   ]);
 });
 
+test("turn status exposes subagent progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-agent-progress-"));
+  temporaryDirectories.push(directory);
+  const client = new FakeOpenCode();
+  client.progress = {
+    steps: 3,
+    activeSubagents: 2,
+    lastActivityAt: Date.now(),
+    lastTool: "bash",
+  };
+  const runtime = createWorkerRuntime({ client, stateFile: join(directory, "state.sqlite") });
+  runtimes.push(runtime);
+
+  const spawned = await runtime.spawn({ task: "slow task", projectRoot: directory });
+  const snapshot = await runtime.status(spawned.turnId);
+  expect(snapshot).toMatchObject({
+    type: "turn",
+    status: "running",
+    progress: { steps: 3, activeSubagents: 2, lastTool: "bash" },
+  });
+  await runtime.interrupt(spawned.workerId);
+});
+
+test("turn status does not mix another turn's progress", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-agent-turn-progress-"));
+  temporaryDirectories.push(directory);
+  const client = new FakeOpenCode(1_000);
+  const runtime = createWorkerRuntime({ client, stateFile: join(directory, "state.sqlite") });
+  runtimes.push(runtime);
+
+  const first = await runtime.spawn({ task: "slow task", projectRoot: directory });
+  const firstProgress: TurnProgress = {
+    steps: 3,
+    activeSubagents: 1,
+    lastActivityAt: Date.now(),
+    lastTool: "bash",
+  };
+  client.progress = firstProgress;
+  client.setTurnProgress(first.turnId, firstProgress);
+  const firstStatus = await runtime.status(first.turnId);
+  expect(firstStatus.type).toBe("turn");
+  if (firstStatus.type === "turn") {
+    expect(firstStatus.progress).toMatchObject({ steps: 3, lastTool: "bash" });
+  }
+
+  const second = await runtime.followup({ workerId: first.workerId, message: "queued task" });
+  client.setTurnProgress(second.turnId, {
+    steps: 99,
+    activeSubagents: 9,
+    lastActivityAt: Date.now(),
+    lastTool: "wrong-turn",
+  });
+  const secondStatus = await runtime.status(second.turnId);
+  expect(secondStatus.type).toBe("turn");
+  if (secondStatus.type === "turn") expect(secondStatus.progress).toBeUndefined();
+  await runtime.interrupt(first.workerId);
+});
+
 class FakeOpenCode implements OpenCodePort {
+  progress?: TurnProgress;
+  private readonly progressByTurn = new Map<string, TurnProgress>();
   private nextSession = 0;
   private active = 0;
   readonly started: string[] = [];
@@ -178,6 +238,14 @@ class FakeOpenCode implements OpenCodePort {
   async abort(): Promise<void> {}
 
   async close(): Promise<void> {}
+
+  setTurnProgress(turnId: string, progress: TurnProgress): void {
+    this.progressByTurn.set(turnId, progress);
+  }
+
+  async turnProgress(turnId?: string): Promise<TurnProgress | undefined> {
+    return (turnId ? this.progressByTurn.get(turnId) : undefined) ?? this.progress;
+  }
 }
 
 function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {

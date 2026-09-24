@@ -1,3 +1,44 @@
+export interface TurnProgress {
+  steps: number;
+  activeSubagents: number;
+  lastActivityAt: number;
+  lastTool?: string;
+}
+
+interface SessionInfo {
+  id: string;
+  parentID?: string;
+  time?: { created?: number };
+}
+
+interface MessagePart {
+  id?: string;
+  type?: string;
+  text?: string;
+  tool?: string;
+  time?: { start?: number; end?: number };
+}
+
+interface MessageEnvelope {
+  info: {
+    id: string;
+    sessionID?: string;
+    role: "user" | "assistant";
+    parentID?: string;
+    time?: { created?: number; completed?: number };
+    finish?: string;
+    error?: unknown;
+  };
+  parts: MessagePart[];
+}
+
+interface MessageSnapshot {
+  fingerprint: string;
+  messageID?: string;
+  createdAt?: number;
+  tool?: string;
+}
+
 export interface OpenCodePort {
   createSession(input: { directory: string; label?: string }): Promise<string>;
   executeTurn(
@@ -6,24 +47,15 @@ export interface OpenCodePort {
     messageId: string,
     input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
+    turnId?: string,
   ): Promise<string>;
   abort(sessionId: string, directory: string): Promise<void>;
   close(sessionId: string, directory: string): Promise<void>;
-}
-
-interface MessageEnvelope {
-  info: {
-    id: string;
-    role: "user" | "assistant";
-    parentID?: string;
-    time?: { created?: number; completed?: number };
-    finish?: string;
-    error?: unknown;
-  };
-  parts: Array<{ type?: string; text?: string }>;
+  turnProgress?(turnId: string, sessionId: string, directory: string): Promise<TurnProgress | undefined>;
 }
 
 interface PendingTurn {
+  readonly turnId: string;
   readonly sessionId: string;
   readonly directory: string;
   readonly userMessageId: string;
@@ -35,11 +67,20 @@ interface PendingTurn {
   readonly failIfIdleWithoutResult: boolean;
   finishing: boolean;
   abortListener(): void;
-  // 最後に何らかの進捗(SSEイベント受信)があった時刻。上流(OpenCode本体)が
-  // リトライ上限に達した後どのイベントも送出せず無応答のまま固まることがあり
-  // (例: レート制限。stream error はサーバー内部ログにのみ残り SSE には来ない)、
-  // その場合でも一定時間で確実に failed へ倒すためのタイムアウト判定に使う。
+  readonly startedAt: number;
   lastActivityAt: number;
+  progress?: TurnProgress;
+  readonly stepKeys: Set<string>;
+  readonly activeSessions: Set<string>;
+  readonly descendantIds: Set<string>;
+  readonly observedMessageIds: Set<string>;
+  readonly messageSnapshots: Map<string, MessageSnapshot>;
+  readonly lastActivityBySession: Map<string, number>;
+  readonly pollPrioritySessionIds: Set<string>;
+  pollDescendantCursor: number;
+  pollMessageCursor: number;
+  polling?: Promise<void>;
+  lastTool?: string;
 }
 
 class OpenCodeFailure extends Error {
@@ -114,6 +155,26 @@ class OpenCodeClient {
       invalidResponse("OpenCode returned an invalid session status.");
     }
     return status;
+  }
+
+  async sessionChildren(sessionId: string, directory: string, timeoutMs: number): Promise<SessionInfo[]> {
+    const response = await this.request(
+      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/children`, directory),
+      { signal: AbortSignal.timeout(timeoutMs) },
+    );
+    return sessionList(await response.json());
+  }
+
+  async latestMessages(
+    sessionId: string,
+    directory: string,
+    limit: number,
+    timeoutMs: number,
+  ): Promise<MessageEnvelope[]> {
+    const url = this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory);
+    url.searchParams.set("limit", String(limit));
+    const response = await this.request(url, { signal: AbortSignal.timeout(timeoutMs) });
+    return messageList(await response.json());
   }
 
   async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
@@ -213,7 +274,7 @@ class OpenCodeClient {
     return url;
   }
 
-  private async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
+  async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
     const response = await this.request(
       this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
     );
@@ -223,11 +284,19 @@ class OpenCodeClient {
 
 const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
 const TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000;
+const DEFAULT_POLL_REQUEST_TIMEOUT_MS = 2_000;
+const DEFAULT_POLL_DESCENDANT_LIMIT = 20;
+const DEFAULT_POLL_MESSAGE_LIMIT = 20;
+const DEFAULT_ACTIVE_SESSION_TTL_MS = 60_000;
+const POLL_MESSAGE_LIMIT = 1;
 
 export class ManagedOpenCode implements OpenCodePort {
   private readonly client: OpenCodeClient;
   private readonly eventAbort = new AbortController();
   private readonly pending = new Map<string, PendingTurn>();
+  private readonly pendingByTurn = new Map<string, PendingTurn>();
+  private readonly sessionParents = new Map<string, string>();
+  private readonly sessionTurns = new Map<string, string>();
   private child?: ReturnType<typeof Bun.spawn>;
   private starting?: Promise<void>;
   private eventsReady?: Promise<void>;
@@ -239,27 +308,31 @@ export class ManagedOpenCode implements OpenCodePort {
     private readonly baseUrl = "http://127.0.0.1:4096",
     private readonly executable = "opencode",
     private readonly turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS,
-    // 本番では変更不要。短い turnTimeoutMs でのテストのためだけに存在する。
     timeoutCheckIntervalMs = TIMEOUT_CHECK_INTERVAL_MS,
+    private readonly pollRequestTimeoutMs = DEFAULT_POLL_REQUEST_TIMEOUT_MS,
+    private readonly pollDescendantLimit = DEFAULT_POLL_DESCENDANT_LIMIT,
+    private readonly pollMessageLimit = DEFAULT_POLL_MESSAGE_LIMIT,
+    private readonly activeSessionTtlMs = DEFAULT_ACTIVE_SESSION_TTL_MS,
   ) {
     this.client = new OpenCodeClient(baseUrl);
-    this.timeoutTimer = setInterval(() => this.checkTimeouts(), timeoutCheckIntervalMs);
+    this.timeoutTimer = setInterval(() => {
+      void this.checkTimeouts();
+    }, timeoutCheckIntervalMs);
     this.timeoutTimer.unref?.();
   }
 
-  // 進捗があったことを記録する。observed フラグを立てる全箇所はここを通すこと
-  // (lastActivityAt を更新し忘れるとタイムアウト検出が効かなくなる)。
-  private markObserved(pending: PendingTurn): void {
+  private markObserved(pending: PendingTurn, activityAt = Date.now()): void {
     pending.observed = true;
-    pending.lastActivityAt = Date.now();
+    pending.lastActivityAt = Math.max(pending.lastActivityAt, activityAt);
+    if (pending.progress) pending.progress = { ...pending.progress, lastActivityAt: pending.lastActivityAt };
   }
 
-  // 進捗イベントが turnTimeoutMs より前から無い pending turn を強制的に失敗させる。
-  // 上流(OpenCode本体)がリトライ失敗後に何も通知してこない場合の最後の砦。
   private checkTimeouts(): void {
-    const now = Date.now();
     for (const pending of [...this.pending.values()]) {
-      if (now - pending.lastActivityAt < this.turnTimeoutMs) continue;
+      if (this.pending.get(pending.sessionId) !== pending) continue;
+      this.pruneInactiveDescendants(pending);
+      this.startPolling(pending);
+      if (Date.now() - pending.lastActivityAt < this.turnTimeoutMs) continue;
       this.rejectPending(
         pending,
         new OpenCodeFailure(
@@ -277,18 +350,138 @@ export class ManagedOpenCode implements OpenCodePort {
     return this.client.createSession(input);
   }
 
+  async turnProgress(turnId: string, sessionId: string, directory: string): Promise<TurnProgress | undefined> {
+    const pending = this.pendingByTurn.get(turnId) ?? (turnId === sessionId ? this.pending.get(sessionId) : undefined);
+    if (!pending || pending.sessionId !== sessionId || pending.directory !== directory) return undefined;
+    this.pruneInactiveDescendants(pending);
+    return pending.progress;
+  }
+
+  private startPolling(pending: PendingTurn): void {
+    if (pending.polling || this.pending.get(pending.sessionId) !== pending) return;
+    const polling = this.pollPending(pending);
+    pending.polling = polling;
+    const clear = () => {
+      if (pending.polling === polling) pending.polling = undefined;
+    };
+    void polling.then(clear, clear);
+  }
+
+  private async pollPending(pending: PendingTurn): Promise<void> {
+    const priority = new Set(pending.pollPrioritySessionIds);
+    pending.pollPrioritySessionIds.clear();
+    try {
+      await this.supplementDescendants(pending, priority);
+      if (this.pending.get(pending.sessionId) !== pending) return;
+      const sessionIds = this.pollCandidates(pending, this.pollMessageLimit, "message", priority);
+      const selectedMessages = new Set(sessionIds);
+      for (const sessionId of priority) {
+        if (!selectedMessages.has(sessionId)) pending.pollPrioritySessionIds.add(sessionId);
+      }
+      await Promise.all(sessionIds.map((sessionId) => this.pollSessionMessages(pending, sessionId)));
+      this.pruneInactiveDescendants(pending);
+    } catch {
+      return;
+    }
+  }
+
+  private async supplementDescendants(pending: PendingTurn, priority: ReadonlySet<string>): Promise<void> {
+    const parentIds = this.pollCandidates(pending, this.pollDescendantLimit, "descendant", priority);
+    for (const parentId of parentIds) {
+      let children: SessionInfo[];
+      try {
+        children = await this.client.sessionChildren(parentId, pending.directory, this.pollRequestTimeoutMs);
+      } catch {
+        continue;
+      }
+      if (this.pending.get(pending.sessionId) !== pending) return;
+      for (const child of children) {
+        if (child.id === pending.sessionId) continue;
+        if (isBeforeTurn(numberValue(child.time?.created), pending.startedAt)) continue;
+        const owner = this.sessionTurns.get(child.id);
+        if (owner && owner !== pending.turnId) continue;
+        this.sessionParents.set(child.id, parentId);
+        this.sessionTurns.set(child.id, pending.turnId);
+        pending.descendantIds.add(child.id);
+      }
+    }
+  }
+
+  private pollCandidates(
+    pending: PendingTurn,
+    limit: number,
+    kind: "descendant" | "message",
+    priority: ReadonlySet<string>,
+  ): string[] {
+    const candidates = [pending.sessionId, ...pending.descendantIds];
+    const maximum = Math.max(0, Math.floor(limit));
+    if (maximum === 0 || candidates.length === 0) return [];
+    const cursor = kind === "descendant" ? pending.pollDescendantCursor : pending.pollMessageCursor;
+    const ordered = candidates
+      .map((sessionId, index) => ({
+        sessionId,
+        order: (index - cursor + candidates.length) % candidates.length,
+        prioritized: priority.has(sessionId),
+      }))
+      .sort((left, right) => Number(right.prioritized) - Number(left.prioritized) || left.order - right.order);
+    const selected = ordered.slice(0, Math.min(maximum, candidates.length)).map(({ sessionId }) => sessionId);
+    const nextCursor = (cursor + Math.min(maximum, candidates.length)) % candidates.length;
+    if (kind === "descendant") pending.pollDescendantCursor = nextCursor;
+    else pending.pollMessageCursor = nextCursor;
+    return selected;
+  }
+
+  private async pollSessionMessages(pending: PendingTurn, sessionId: string): Promise<void> {
+    let messages: MessageEnvelope[];
+    try {
+      messages = await this.client.latestMessages(
+        sessionId,
+        pending.directory,
+        POLL_MESSAGE_LIMIT,
+        this.pollRequestTimeoutMs,
+      );
+    } catch {
+      return;
+    }
+    if (this.pending.get(pending.sessionId) !== pending) return;
+    const snapshot = snapshotMessages(messages);
+    const previous = pending.messageSnapshots.get(sessionId);
+    pending.messageSnapshots.set(sessionId, snapshot);
+    if (!snapshot.messageID) return;
+    if (!previous) {
+      const messageKey = messageStepKey(sessionId, snapshot.messageID);
+      if (
+        !pending.observedMessageIds.has(messageKey) &&
+        (snapshot.createdAt === undefined || snapshot.createdAt >= pending.startedAt)
+      ) {
+        this.observeActivity(
+          pending,
+          sessionId,
+          Date.now(),
+          messageKey,
+          snapshot.tool,
+        );
+      }
+      return;
+    }
+    if (previous.fingerprint === snapshot.fingerprint) return;
+    const stepKey = previous.messageID === snapshot.messageID ? undefined : messageStepKey(sessionId, snapshot.messageID);
+    this.observeActivity(pending, sessionId, Date.now(), stepKey, snapshot.tool);
+  }
+
   async executeTurn(
     sessionId: string,
     directory: string,
     messageId: string,
     input: { message: string; agent?: string; model?: string },
     signal: AbortSignal,
+    turnId = sessionId,
   ): Promise<string> {
     await this.ensureRunning();
     const existing = await this.client.findAssistant(sessionId, directory, messageId);
     if (existing && isTerminalMessage(existing.info)) return resultText(existing);
     const persisted = Boolean(existing) || (await this.client.hasUserMessage(sessionId, directory, messageId));
-    const pending = this.watch(sessionId, directory, messageId, signal, persisted);
+    const pending = this.watch(turnId, sessionId, directory, messageId, signal, persisted);
     if (existing) this.markObserved(pending);
     try {
       if (!persisted) await this.client.promptAsync(sessionId, directory, messageId, input);
@@ -314,11 +507,13 @@ export class ManagedOpenCode implements OpenCodePort {
     this.stopped = true;
     clearInterval(this.timeoutTimer);
     this.eventAbort.abort();
-    for (const pending of this.pending.values()) {
-      pending.reject(new OpenCodeFailure("OPENCODE_STOPPED", "The OpenCode host stopped.", true));
-      pending.signal.removeEventListener("abort", pending.abortListener);
+    for (const pending of [...this.pending.values()]) {
+      this.rejectPending(pending, new OpenCodeFailure("OPENCODE_STOPPED", "The OpenCode host stopped.", true));
     }
     this.pending.clear();
+    this.pendingByTurn.clear();
+    this.sessionParents.clear();
+    this.sessionTurns.clear();
 
     const child = this.child;
     this.child = undefined;
@@ -395,7 +590,10 @@ export class ManagedOpenCode implements OpenCodePort {
         if (!this.stopped) this.scheduleReconnect();
       });
     await this.resolvePendingPrompts();
-    for (const pending of this.pending.values()) void this.refresh(pending);
+    for (const pending of this.pending.values()) {
+      this.startPolling(pending);
+      void this.refresh(pending);
+    }
   }
 
   private scheduleReconnect(): void {
@@ -464,6 +662,9 @@ export class ManagedOpenCode implements OpenCodePort {
     const properties = payload.properties as Record<string, unknown>;
 
     switch (payload.type) {
+      case "session.created":
+        this.handleSessionCreated(properties);
+        break;
       case "permission.asked":
       case "permission.v2.asked":
         if (
@@ -492,52 +693,32 @@ export class ManagedOpenCode implements OpenCodePort {
           });
         }
         break;
-      case "message.updated": {
-        const info = properties.info;
-        if (!info || typeof info !== "object") break;
-        const message = info as {
-          id?: unknown;
-          sessionID?: unknown;
-          role?: unknown;
-          parentID?: unknown;
-          error?: unknown;
-          finish?: unknown;
-          time?: { completed?: unknown };
-        };
-        const sessionId =
-          typeof message.sessionID === "string"
-            ? message.sessionID
-            : typeof properties.sessionID === "string"
-              ? properties.sessionID
-              : undefined;
-        const pending = sessionId ? this.pending.get(sessionId) : undefined;
-        if (
-          sessionId !== undefined &&
-          pending &&
-          message.role === "assistant" &&
-          message.parentID === pending.userMessageId &&
-          typeof message.id === "string"
-        ) {
-          this.markObserved(pending);
-          if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
-          else if (isTerminalMessage(message)) void this.finish(sessionId);
-        }
+      case "message.updated":
+        this.handleMessageUpdated(properties);
+        break;
+      case "message.part.updated":
+        this.handlePartUpdated(properties);
+        break;
+      case "session.idle": {
+        if (typeof properties.sessionID !== "string") break;
+        const pending = this.pendingForSession(properties.sessionID);
+        if (!pending) break;
+        if (properties.sessionID === pending.sessionId) void this.refresh(pending);
+        else this.deactivate(pending, properties.sessionID);
         break;
       }
-      case "session.idle":
-        if (typeof properties.sessionID === "string") {
-          const pending = this.pending.get(properties.sessionID);
-          if (pending) void this.refresh(pending);
-        }
-        break;
       case "session.status": {
-        const status = properties.status;
-        if (typeof properties.sessionID === "string" && status && typeof status === "object") {
-          const pending = this.pending.get(properties.sessionID);
-          if (!pending) break;
-          const type = (status as { type?: unknown }).type;
-          if (type === "busy" || type === "retry") this.markObserved(pending);
-          else if (type === "idle") void this.refresh(pending);
+        if (typeof properties.sessionID !== "string" || !properties.status || typeof properties.status !== "object") {
+          break;
+        }
+        const pending = this.pendingForSession(properties.sessionID);
+        if (!pending) break;
+        const type = (properties.status as { type?: unknown }).type;
+        if (type === "busy" || type === "retry") {
+          this.observeActivity(pending, properties.sessionID, Date.now());
+        } else if (type === "idle") {
+          if (properties.sessionID === pending.sessionId) void this.refresh(pending);
+          else this.deactivate(pending, properties.sessionID);
         }
         break;
       }
@@ -547,7 +728,160 @@ export class ManagedOpenCode implements OpenCodePort {
     }
   }
 
+  private handleSessionCreated(properties: Record<string, unknown>): void {
+    const info = properties.info;
+    if (!info || typeof info !== "object") return;
+    const session = info as { id?: unknown; parentID?: unknown; time?: { created?: unknown } };
+    if (typeof session.id !== "string") return;
+    const parentID = typeof session.parentID === "string" ? session.parentID : undefined;
+    const inheritedTurn = parentID ? this.sessionTurns.get(parentID) : undefined;
+    const turnId = inheritedTurn ?? this.pending.get(this.rootSession(session.id))?.turnId;
+    if (!turnId) return;
+    const pending = this.pendingByTurn.get(turnId);
+    if (!pending) return;
+    if (isBeforeTurn(numberValue(session.time?.created), pending.startedAt)) return;
+    if (parentID) this.sessionParents.set(session.id, parentID);
+    this.sessionTurns.set(session.id, turnId);
+    if (session.id !== pending.sessionId) pending.descendantIds.add(session.id);
+    this.observeActivity(pending, session.id, Date.now());
+  }
+
+  private handleMessageUpdated(properties: Record<string, unknown>): void {
+    const info = properties.info;
+    if (!info || typeof info !== "object") return;
+    const message = info as {
+      id?: unknown;
+      sessionID?: unknown;
+      role?: unknown;
+      parentID?: unknown;
+      error?: unknown;
+      finish?: unknown;
+      time?: { created?: unknown; completed?: unknown };
+    };
+    const sessionId =
+      typeof message.sessionID === "string"
+        ? message.sessionID
+        : typeof properties.sessionID === "string"
+          ? properties.sessionID
+          : undefined;
+    if (!sessionId) return;
+    const pending = this.pendingForSession(sessionId);
+    if (!pending) return;
+    const at = numberValue(message.time?.completed ?? message.time?.created) ?? Date.now();
+    if (typeof message.id === "string") pending.observedMessageIds.add(messageStepKey(sessionId, message.id));
+    const stepKey =
+      message.role === "assistant" && typeof message.id === "string" ? messageStepKey(sessionId, message.id) : undefined;
+    this.observeActivity(pending, sessionId, at, stepKey);
+    if (
+      sessionId === pending.sessionId &&
+      message.role === "assistant" &&
+      message.parentID === pending.userMessageId &&
+      typeof message.id === "string"
+    ) {
+      if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
+      else if (isTerminalMessage(message)) void this.finish(sessionId);
+    }
+  }
+
+  private handlePartUpdated(properties: Record<string, unknown>): void {
+    const part = properties.part;
+    if (!part || typeof part !== "object") return;
+    const value = part as {
+      id?: unknown;
+      messageID?: unknown;
+      sessionID?: unknown;
+      type?: unknown;
+      tool?: unknown;
+    };
+    const sessionId =
+      typeof value.sessionID === "string"
+        ? value.sessionID
+        : typeof properties.sessionID === "string"
+          ? properties.sessionID
+          : undefined;
+    if (!sessionId) return;
+    const pending = this.pendingForSession(sessionId);
+    if (!pending) return;
+    const messageID = typeof value.messageID === "string" ? value.messageID : undefined;
+    if (messageID) pending.observedMessageIds.add(messageStepKey(sessionId, messageID));
+    const stepKey =
+      (value.type === "step-start" || value.type === "step-finish") && messageID
+        ? messageStepKey(sessionId, messageID)
+        : undefined;
+    const tool = typeof value.tool === "string" && value.tool ? value.tool : undefined;
+    this.observeActivity(pending, sessionId, numberValue(properties.time) ?? Date.now(), stepKey, tool);
+  }
+
+  private pendingForSession(sessionId: string): PendingTurn | undefined {
+    const turnId = this.sessionTurns.get(sessionId);
+    if (turnId) return this.pendingByTurn.get(turnId);
+    const rootId = this.rootSession(sessionId);
+    if (rootId === sessionId) return this.pending.get(rootId);
+    const pending = this.pending.get(rootId);
+    return pending?.descendantIds.has(sessionId) ? pending : undefined;
+  }
+
+  private rootSession(sessionId: string): string {
+    let current = sessionId;
+    const seen = new Set<string>();
+    while (!seen.has(current)) {
+      seen.add(current);
+      const parentID = this.sessionParents.get(current);
+      if (!parentID) break;
+      current = parentID;
+    }
+    return current;
+  }
+
+  private observeActivity(
+    pending: PendingTurn,
+    sessionId: string,
+    activityAt: number,
+    stepKey?: string,
+    tool?: string,
+  ): void {
+    this.markObserved(pending, activityAt);
+    if (sessionId !== pending.sessionId) {
+      pending.activeSessions.add(sessionId);
+      pending.lastActivityBySession.set(sessionId, Date.now());
+      pending.pollPrioritySessionIds.add(sessionId);
+    }
+    if (stepKey) pending.stepKeys.add(stepKey);
+    if (tool) pending.lastTool = tool;
+    this.updateProgress(pending);
+  }
+
+  private deactivate(pending: PendingTurn, sessionId: string): void {
+    pending.activeSessions.delete(sessionId);
+    pending.lastActivityBySession.delete(sessionId);
+    pending.pollPrioritySessionIds.delete(sessionId);
+    this.updateProgress(pending);
+  }
+
+  private pruneInactiveDescendants(pending: PendingTurn): void {
+    const now = Date.now();
+    let changed = false;
+    for (const [sessionId, lastActivityAt] of pending.lastActivityBySession) {
+      if (now - lastActivityAt < this.activeSessionTtlMs) continue;
+      pending.activeSessions.delete(sessionId);
+      pending.pollPrioritySessionIds.delete(sessionId);
+      pending.lastActivityBySession.delete(sessionId);
+      changed = true;
+    }
+    if (changed) this.updateProgress(pending);
+  }
+
+  private updateProgress(pending: PendingTurn): void {
+    pending.progress = {
+      steps: pending.stepKeys.size,
+      activeSubagents: pending.activeSessions.size,
+      lastActivityAt: pending.lastActivityAt,
+      ...(pending.lastTool === undefined ? {} : { lastTool: pending.lastTool }),
+    };
+  }
+
   private watch(
+    turnId: string,
     sessionId: string,
     directory: string,
     userMessageId: string,
@@ -562,7 +896,9 @@ export class ManagedOpenCode implements OpenCodePort {
       );
     }
     const { promise, resolve, reject } = Promise.withResolvers<string>();
+    const startedAt = Date.now();
     const pending: PendingTurn = {
+      turnId,
       sessionId,
       directory,
       userMessageId,
@@ -573,7 +909,17 @@ export class ManagedOpenCode implements OpenCodePort {
       observed: false,
       failIfIdleWithoutResult,
       finishing: false,
-      lastActivityAt: Date.now(),
+      startedAt,
+      lastActivityAt: startedAt,
+      stepKeys: new Set(),
+      activeSessions: new Set(),
+      descendantIds: new Set(),
+      observedMessageIds: new Set(),
+      messageSnapshots: new Map(),
+      lastActivityBySession: new Map(),
+      pollPrioritySessionIds: new Set(),
+      pollDescendantCursor: 0,
+      pollMessageCursor: 0,
       abortListener: () => {
         this.rejectPending(
           pending,
@@ -582,6 +928,8 @@ export class ManagedOpenCode implements OpenCodePort {
       },
     };
     this.pending.set(sessionId, pending);
+    this.pendingByTurn.set(turnId, pending);
+    this.sessionTurns.set(sessionId, turnId);
     signal.addEventListener("abort", pending.abortListener, { once: true });
     if (signal.aborted) pending.abortListener();
     return pending;
@@ -639,6 +987,8 @@ export class ManagedOpenCode implements OpenCodePort {
   private resolvePending(pending: PendingTurn, text: string): void {
     if (this.pending.get(pending.sessionId) !== pending) return;
     this.pending.delete(pending.sessionId);
+    this.pendingByTurn.delete(pending.turnId);
+    this.cleanupPendingMappings(pending);
     pending.signal.removeEventListener("abort", pending.abortListener);
     pending.resolve(text);
   }
@@ -646,8 +996,25 @@ export class ManagedOpenCode implements OpenCodePort {
   private rejectPending(pending: PendingTurn, error: unknown): void {
     if (this.pending.get(pending.sessionId) !== pending) return;
     this.pending.delete(pending.sessionId);
+    this.pendingByTurn.delete(pending.turnId);
+    this.cleanupPendingMappings(pending);
     pending.signal.removeEventListener("abort", pending.abortListener);
     pending.reject(error);
+  }
+
+  private cleanupPendingMappings(pending: PendingTurn): void {
+    for (const [sessionId, turnId] of this.sessionTurns) {
+      if (turnId === pending.turnId) this.sessionTurns.delete(sessionId);
+    }
+    this.sessionParents.delete(pending.sessionId);
+    for (const sessionId of pending.descendantIds) this.sessionParents.delete(sessionId);
+    pending.descendantIds.clear();
+    pending.activeSessions.clear();
+    pending.lastActivityBySession.clear();
+    pending.pollPrioritySessionIds.clear();
+    pending.messageSnapshots.clear();
+    pending.observedMessageIds.clear();
+    pending.stepKeys.clear();
   }
 
   private failSession(sessionId: unknown, error: unknown): void {
@@ -737,13 +1104,29 @@ function errorFromAssistant(error: unknown): OpenCodeFailure {
 
 function isRelevantEvent(data: string): boolean {
   return (
+    data.includes("session.created") ||
     data.includes("permission.") ||
     data.includes("question.") ||
     data.includes("message.updated") ||
+    data.includes("message.part.updated") ||
     data.includes("session.idle") ||
     data.includes("session.status") ||
     data.includes("session.error")
   );
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function isBeforeTurn(createdAt: number | undefined, startedAt: number): boolean {
+  if (createdAt === undefined) return false;
+  const normalized = createdAt < startedAt / 1000 ? createdAt * 1000 : createdAt;
+  return normalized < startedAt;
+}
+
+function messageStepKey(sessionId: string, messageId: string): string {
+  return `message:${sessionId}:${messageId}`;
 }
 
 function isLocalHost(hostname: string): boolean {
@@ -797,20 +1180,88 @@ function messageList(value: unknown): MessageEnvelope[] {
     }
     const parts = message.parts.map((part) => {
       if (!part || typeof part !== "object") invalidResponse("OpenCode returned an invalid message part.");
-      const value = part as { type?: unknown; text?: unknown };
+      const value = part as {
+        id?: unknown;
+        type?: unknown;
+        text?: unknown;
+        tool?: unknown;
+        time?: unknown;
+      };
+      if (value.id !== undefined && typeof value.id !== "string") {
+        invalidResponse("OpenCode returned an invalid message part ID.");
+      }
       if (value.type !== undefined && typeof value.type !== "string") {
         invalidResponse("OpenCode returned an invalid message part type.");
       }
       if (value.text !== undefined && typeof value.text !== "string") {
         invalidResponse("OpenCode returned invalid message text.");
       }
+      if (value.tool !== undefined && typeof value.tool !== "string") {
+        invalidResponse("OpenCode returned invalid message part tool.");
+      }
+      if (value.time !== undefined && (!value.time || typeof value.time !== "object")) {
+        invalidResponse("OpenCode returned an invalid message part time.");
+      }
       return {
+        id: typeof value.id === "string" ? value.id : undefined,
         type: typeof value.type === "string" ? value.type : undefined,
         text: typeof value.text === "string" ? value.text : undefined,
+        tool: typeof value.tool === "string" ? value.tool : undefined,
+        time: value.time as MessagePart["time"],
       };
     });
     return { info: info as unknown as MessageEnvelope["info"], parts };
   });
+}
+
+function sessionList(value: unknown): SessionInfo[] {
+  if (!Array.isArray(value)) invalidResponse("OpenCode returned an invalid session list.");
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid session.");
+    const session = entry as { id?: unknown; parentID?: unknown; time?: unknown };
+    if (typeof session.id !== "string") invalidResponse("OpenCode returned an invalid session ID.");
+    if (session.parentID !== undefined && typeof session.parentID !== "string") {
+      invalidResponse("OpenCode returned an invalid parent session ID.");
+    }
+    if (session.time !== undefined && (!session.time || typeof session.time !== "object")) {
+      invalidResponse("OpenCode returned an invalid session time.");
+    }
+    const time = session.time as { created?: unknown } | undefined;
+    if (time?.created !== undefined && typeof time.created !== "number") {
+      invalidResponse("OpenCode returned an invalid session creation time.");
+    }
+    return {
+      id: session.id,
+      ...(typeof session.parentID === "string" ? { parentID: session.parentID } : {}),
+      ...(typeof time?.created === "number" ? { time: { created: time.created } } : {}),
+    };
+  });
+}
+
+function snapshotMessages(messages: MessageEnvelope[]): MessageSnapshot {
+  const message = messages[messages.length - 1];
+  if (!message) return { fingerprint: "empty" };
+  let tool: string | undefined;
+  const parts = message.parts.map((part) => {
+    if (typeof part.tool === "string" && part.tool) tool = part.tool;
+    return {
+      id: part.id,
+      type: part.type,
+      tool: part.tool,
+      time: part.time,
+    };
+  });
+  return {
+    fingerprint: JSON.stringify({
+      id: message.info.id,
+      created: message.info.time?.created,
+      completed: message.info.time?.completed,
+      parts: parts.map((part) => ({ id: part.id, time: part.time })),
+    }),
+    messageID: message.info.id,
+    ...(message.info.time?.created === undefined ? {} : { createdAt: message.info.time.created }),
+    ...(tool === undefined ? {} : { tool }),
+  };
 }
 
 function invalidResponse(message: string): never {
