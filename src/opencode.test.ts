@@ -517,6 +517,275 @@ test("polling catches child activity missed by SSE", async () => {
   }
 });
 
+test("polling caps descendant discovery and message requests per round", async () => {
+  let openCode!: FakeOpenCode;
+  let rootId = "";
+  let descendantsRequests = 0;
+  let firstRoundResolve!: () => void;
+  let secondRoundResolve!: () => void;
+  const firstRound = new Promise<void>((resolve) => {
+    firstRoundResolve = resolve;
+  });
+  const secondRound = new Promise<void>((resolve) => {
+    secondRoundResolve = resolve;
+  });
+  let rootPolls = 0;
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      rootId = context.session.id;
+      context.session.status = "busy";
+      context.addUser();
+      for (let index = 0; index < 6; index++) {
+        const child = openCode.session(`capped-child-${index}`, process.cwd(), rootId, false);
+        if (index === 5) addPolledMessage(child, 1, "bash");
+      }
+    },
+    childrenStatus() {
+      descendantsRequests++;
+      return 200;
+    },
+    pollMessagesResponse(session) {
+      if (session?.id === rootId) {
+        rootPolls++;
+        if (rootPolls === 1) firstRoundResolve();
+        if (rootPolls === 2) secondRoundResolve();
+      }
+      return session?.messages ?? [];
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
+  const pending = client.executeTurn(
+    await client.createSession({ directory: process.cwd() }),
+    process.cwd(),
+    "msg_00000000000000000000000000000010",
+    { message: "cap polling" },
+    new AbortController().signal,
+    "turn-cap-polling",
+  );
+  pending.catch(() => {});
+  try {
+    await firstRound;
+    expect(descendantsRequests).toBeLessThanOrEqual(2);
+    expect(openCode.pollMessageRequests).toBeLessThanOrEqual(2);
+    await secondRound;
+    expect(descendantsRequests).toBeGreaterThan(2);
+    expect(openCode.pollMessageRequests).toBeGreaterThan(2);
+    await Bun.sleep(100);
+    const progress = await client.turnProgress("turn-cap-polling", rootId, process.cwd());
+    expect(progress?.lastTool).toBe("bash");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("recently active descendants are polled before older descendants", async () => {
+  let openCode!: FakeOpenCode;
+  let rootId = "";
+  let targetId = "";
+  const firstBatch: string[] = [];
+  let firstBatchResolve!: () => void;
+  const firstBatchReady = new Promise<void>((resolve) => {
+    firstBatchResolve = resolve;
+  });
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      rootId = context.session.id;
+      context.session.status = "busy";
+      context.addUser();
+      for (let index = 0; index < 5; index++) {
+        openCode.session(`older-child-${index}`, process.cwd(), rootId, false);
+      }
+      const target = openCode.session("recent-child", process.cwd(), rootId, false);
+      targetId = target.id;
+      openCode.emit("session.created", {
+        info: { id: target.id, parentID: rootId, time: { created: Date.now() } },
+      });
+      openCode.emit("message.part.updated", {
+        sessionID: target.id,
+        time: Date.now(),
+        part: {
+          id: "recent-part",
+          messageID: "recent-message",
+          sessionID: target.id,
+          type: "step-start",
+        },
+      });
+    },
+    pollMessagesResponse(session) {
+      if (session && firstBatch.length < 2) {
+        firstBatch.push(session.id);
+        if (firstBatch.length === 2) firstBatchResolve();
+      }
+      return [];
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
+  const session = await client.createSession({ directory: process.cwd() });
+  const pending = client.executeTurn(
+    session,
+    process.cwd(),
+    "msg_00000000000000000000000000000011",
+    { message: "prioritize recent descendants" },
+    new AbortController().signal,
+    "turn-prioritize-polling",
+  );
+  pending.catch(() => {});
+  try {
+    await firstBatchReady;
+    expect(firstBatch).toContain(targetId);
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("the same message is counted once when polling and SSE overlap", async () => {
+  let openCode!: FakeOpenCode;
+  let context!: PromptContext;
+  let child!: FakeSession;
+  let firstPolledResolve!: () => void;
+  const firstPolled = new Promise<void>((resolve) => {
+    firstPolledResolve = resolve;
+  });
+  openCode = startFakeOpenCode({
+    onPrompt(current) {
+      context = current;
+      current.session.status = "busy";
+      current.addUser();
+      child = openCode.session("overlap-child", process.cwd(), current.session.id, false);
+      addPolledMessage(child, 1, "bash");
+    },
+    pollMessagesResponse(session) {
+      if (session?.id === child?.id) firstPolledResolve();
+      return session?.messages ?? [];
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
+  const session = await client.createSession({ directory: process.cwd() });
+  const pending = client.executeTurn(
+    session,
+    process.cwd(),
+    "msg_00000000000000000000000000000012",
+    { message: "deduplicate steps" },
+    new AbortController().signal,
+    "turn-deduplicate-steps",
+  );
+  pending.catch(() => {});
+  try {
+    await firstPolled;
+    await Bun.sleep(10);
+    openCode.emit("message.part.updated", {
+      sessionID: child.id,
+      time: Date.now(),
+      part: {
+        id: "overlap-start",
+        messageID: child.messages[0]!.info.id,
+        sessionID: child.id,
+        type: "step-start",
+      },
+    });
+    await Bun.sleep(20);
+    const progress = await client.turnProgress("turn-deduplicate-steps", session, process.cwd());
+    expect(progress?.steps).toBe(1);
+    const assistant = context.addAssistant({ text: "deduplicated" });
+    context.complete(assistant);
+    await expect(pending).resolves.toBe("deduplicated");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("completed turn descendants do not attach to a follow-up turn", async () => {
+  let openCode!: FakeOpenCode;
+  let secondContext: PromptContext | undefined;
+  let sessionId = "";
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      sessionId = context.session.id;
+      context.session.status = "busy";
+      context.addUser();
+      if (context.prompt === "first turn") {
+        openCode.session("retired-child", process.cwd(), sessionId);
+        void (async () => {
+          await Bun.sleep(20);
+          const assistant = context.addAssistant({ text: "first complete" });
+          context.complete(assistant);
+        })();
+      } else {
+        secondContext = context;
+      }
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_00000000000000000000000000000013",
+      { message: "first turn" },
+      new AbortController().signal,
+      "turn-first",
+    );
+    const second = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_00000000000000000000000000000014",
+      { message: "second turn" },
+      new AbortController().signal,
+      "turn-second",
+    );
+    second.catch(() => {});
+    await Bun.sleep(20);
+    openCode.emit("session.created", {
+      info: { id: "retired-child", parentID: sessionId, time: { created: 1 } },
+    });
+    await Bun.sleep(20);
+    const progress = await client.turnProgress("turn-second", session, process.cwd());
+    expect(progress?.activeSubagents).toBe(0);
+    if (!secondContext) throw new Error("second prompt did not start");
+    const assistant = secondContext.addAssistant({ text: "second complete" });
+    secondContext.complete(assistant);
+    await expect(second).resolves.toBe("second complete");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("inactive descendants leave activeSubagents after the idle grace period", async () => {
+  let openCode!: FakeOpenCode;
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.status = "busy";
+      context.addUser();
+      const child = openCode.session("stale-child", process.cwd(), context.session.id);
+      emitStep(openCode, child, 1, "bash");
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10, 2_000, 2, 2, 30);
+  const session = await client.createSession({ directory: process.cwd() });
+  const pending = client.executeTurn(
+    session,
+    process.cwd(),
+    "msg_00000000000000000000000000000015",
+    { message: "stale child" },
+    new AbortController().signal,
+    "turn-stale-child",
+  );
+  pending.catch(() => {});
+  try {
+    await Bun.sleep(80);
+    const progress = await client.turnProgress("turn-stale-child", session, process.cwd());
+    expect(progress?.activeSubagents).toBe(0);
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
 test("polling finds descendants beyond the first hundred sessions", async () => {
   let secondContext: PromptContext | undefined;
   let openCode!: FakeOpenCode;
