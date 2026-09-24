@@ -41,6 +41,7 @@ export interface FakeOpenCode {
   readonly approvals: string[];
   readonly submissions: number;
   session(id: string, directory?: string, parentID?: string): FakeSession;
+  emit(type: string, properties: Record<string, unknown>): void;
   touch(id: string): FakeSession;
   stop(): void;
 }
@@ -170,12 +171,14 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
 
   function session(id: string, directory = process.cwd(), parentID?: string): FakeSession {
     let value = sessions.get(id);
+    const created = !value;
     if (!value) {
       value = { id, directory, status: "idle", messages: [], parentID, updatedAt: Date.now() };
       sessions.set(id, value);
     } else if (parentID !== undefined) {
       value.parentID = parentID;
     }
+    if (created) emit("session.created", { info: toSessionPayload(value) });
     return value;
   }
 
@@ -271,6 +274,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     approvals,
     get submissions() { return submissions; },
     session,
+    emit,
     touch,
     stop() { server.stop(true); },
   };

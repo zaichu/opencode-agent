@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { startFakeOpenCode, type FakeMessage, type PromptContext } from "../test/fake-opencode.ts";
+import { startFakeOpenCode, type FakeMessage, type FakeOpenCode, type FakeSession, type PromptContext } from "../test/fake-opencode.ts";
 import { ManagedOpenCode } from "./opencode.ts";
 
 test("permission asks are auto-approved only for an active adapter worker", async () => {
@@ -255,31 +255,18 @@ test("a turn that reports no progress for turnTimeoutMs is failed as a timeout",
   }
 });
 
-test("child-only activity postpones the timeout", async () => {
-  // 親の SSE には何も流れないが、子セッションだけが動き続けるケース。
-  // 30秒検査(ここでは短縮)が子孫の Session.time.updated を見て
-  // lastActivityAt を更新し続ける限りタイムアウトしないことを検証する。
+test("child-only SSE activity postpones the timeout", async () => {
   let parentId = "";
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       parentId = context.session.id;
       context.session.status = "idle";
       context.addUser();
-      // 親は SSE で何も送らない: busy にも idle にも complete にもしない。
       void (async () => {
         for (let i = 0; i < 6; i++) {
           await Bun.sleep(20);
           const child = openCode.session(`child-active-${i}`, process.cwd(), parentId);
-          child.messages.push({
-            info: {
-              id: `child-assistant-${i}`,
-              sessionID: child.id,
-              role: "assistant",
-              time: { created: Date.now() },
-            },
-            parts: [{ type: "tool", tool: "bash" }],
-          });
-          openCode.touch(child.id);
+          emitStep(openCode, child, i, "bash");
         }
         await Bun.sleep(10);
         const assistant = context.addAssistant({ text: "parent done after children" });
@@ -296,6 +283,7 @@ test("child-only activity postpones the timeout", async () => {
       "msg_99999999999999999999999999999991",
       { message: "delegate to subagents" },
       new AbortController().signal,
+      "turn-child-sse",
     );
     expect(result).toBe("parent done after children");
   } finally {
@@ -304,8 +292,101 @@ test("child-only activity postpones the timeout", async () => {
   }
 });
 
-test("stalled children still time out", async () => {
-  // 子が一度だけ動いて止まり、親も何も送らなければタイムアウトすることを検証する。
+test("events from a completed turn do not mark the next turn", async () => {
+  let secondContext: PromptContext | undefined;
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.status = "idle";
+      context.addUser();
+      if (context.prompt === "first turn") {
+        const oldChild = openCode.session("old-child", process.cwd(), context.session.id);
+        emitStep(openCode, oldChild, 1, "old-tool");
+        void (async () => {
+          await Bun.sleep(10);
+          const assistant = context.addAssistant({ text: "first complete" });
+          context.complete(assistant);
+        })();
+      } else {
+        secondContext = context;
+      }
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 500, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_11111111111111111111111111111111",
+      { message: "first turn" },
+      new AbortController().signal,
+      "turn-one",
+    );
+    const second = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_22222222222222222222222222222222",
+      { message: "second turn" },
+      new AbortController().signal,
+      "turn-two",
+    );
+    await Bun.sleep(30);
+    openCode.emit("session.status", { sessionID: "old-child", status: { type: "busy" } });
+    openCode.emit("message.part.updated", {
+      sessionID: "old-child",
+      time: Date.now(),
+      part: { id: "old-late", messageID: "old-late-message", sessionID: "old-child", type: "tool", tool: "old-tool" },
+    });
+    await Bun.sleep(10);
+    const progress = await client.turnProgress("turn-two", session, process.cwd());
+    expect(progress?.activeSubagents).toBe(0);
+    expect(progress?.lastTool).toBeUndefined();
+    if (!secondContext) throw new Error("second prompt did not start");
+    const assistant = secondContext.addAssistant({ text: "second complete" });
+    secondContext.complete(assistant);
+    await expect(second).resolves.toBe("second complete");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("grandchild SSE activity is included in progress", async () => {
+  let parentId = "";
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      parentId = context.session.id;
+      context.session.status = "idle";
+      context.addUser();
+      const child = openCode.session("child-progress-parent", process.cwd(), parentId);
+      const grandchild = openCode.session("grandchild-progress", process.cwd(), child.id);
+      emitStep(openCode, child, 1, "read");
+      emitStep(openCode, grandchild, 1, "bash");
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const pending = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_99999999999999999999999999999993",
+      { message: "delegate to a grandchild" },
+      new AbortController().signal,
+      "turn-grandchild-sse",
+    );
+    pending.catch(() => {});
+    await Bun.sleep(40);
+    const progress = await client.turnProgress("turn-grandchild-sse", session, process.cwd());
+    expect(progress).toMatchObject({ steps: 2, activeSubagents: 2, lastTool: "bash" });
+    await client.stop();
+    await expect(pending).rejects.toMatchObject({ code: "OPENCODE_STOPPED" });
+  } finally {
+    openCode.stop();
+  }
+});
+
+test("stalled child SSE activity still times out", async () => {
   let parentId = "";
   const openCode = startFakeOpenCode({
     onPrompt(context) {
@@ -313,16 +394,7 @@ test("stalled children still time out", async () => {
       context.session.status = "idle";
       context.addUser();
       const child = openCode.session("child-stalled", process.cwd(), parentId);
-      child.messages.push({
-        info: {
-          id: "child-assistant-once",
-          sessionID: child.id,
-          role: "assistant",
-          time: { created: Date.now() },
-        },
-        parts: [{ type: "text", text: "one step" }],
-      });
-      openCode.touch(child.id);
+      emitStep(openCode, child, 1, "read");
     },
   });
   const client = new ManagedOpenCode(openCode.url, "opencode", 60, 10);
@@ -335,6 +407,7 @@ test("stalled children still time out", async () => {
         "msg_99999999999999999999999999999992",
         { message: "children stall" },
         new AbortController().signal,
+        "turn-stalled-sse",
       ),
     ).rejects.toMatchObject({ code: "OPENCODE_TURN_TIMEOUT", retryable: true });
   } finally {
@@ -351,17 +424,7 @@ test("turn progress summarizes subagent activity", async () => {
       context.session.status = "idle";
       context.addUser();
       const child = openCode.session("child-progress", process.cwd(), parentId);
-      child.messages.push({
-        info: {
-          id: "child-assistant-progress",
-          sessionID: child.id,
-          role: "assistant",
-          time: { created: Date.now() },
-        },
-        parts: [{ type: "tool", tool: "bash" }],
-      });
-      openCode.touch(child.id);
-      // turn は終わらせない。progress だけを検査する。
+      emitStep(openCode, child, 1, "bash");
     },
   });
   const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10);
@@ -373,10 +436,11 @@ test("turn progress summarizes subagent activity", async () => {
       "msg_99999999999999999999999999999993",
       { message: "check progress" },
       new AbortController().signal,
+      "turn-progress",
     );
     pending.catch(() => {});
     await Bun.sleep(80);
-    const progress = await client.turnProgress(session, process.cwd());
+    const progress = await client.turnProgress("turn-progress", session, process.cwd());
     expect(progress).toMatchObject({ activeSubagents: 1, lastTool: "bash" });
     expect(progress?.steps).toBeGreaterThanOrEqual(1);
     expect(progress?.lastActivityAt).toBeGreaterThan(0);
@@ -386,6 +450,7 @@ test("turn progress summarizes subagent activity", async () => {
     openCode.stop();
   }
 });
+
 test("progress events (busy) postpone the timeout", async () => {
   // busy イベントで lastActivityAt が更新される限りタイムアウトしないことを
   // 確認する。turnTimeoutMs(60ms) の合計より長い期間 busy を送り続けても
@@ -418,3 +483,20 @@ test("progress events (busy) postpone the timeout", async () => {
     openCode.stop();
   }
 });
+
+function emitStep(openCode: FakeOpenCode, session: FakeSession, step: number, tool?: string): void {
+  const messageID = `${session.id}-message-${step}`;
+  openCode.emit("session.status", { sessionID: session.id, status: { type: "busy" } });
+  openCode.emit("message.part.updated", {
+    sessionID: session.id,
+    time: Date.now(),
+    part: { id: `${messageID}-start`, messageID, sessionID: session.id, type: "step-start" },
+  });
+  if (tool) {
+    openCode.emit("message.part.updated", {
+      sessionID: session.id,
+      time: Date.now(),
+      part: { id: `${messageID}-tool`, messageID, sessionID: session.id, type: "tool", tool },
+    });
+  }
+}

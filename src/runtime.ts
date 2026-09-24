@@ -148,6 +148,7 @@ export function createWorkerRuntime(input: {
           model: turn.model ?? worker.model,
         },
         controller.signal,
+        turn.id,
       );
       if (!disposing) next = registry.finishTurn(turn.id, text);
     } catch (error) {
@@ -242,7 +243,11 @@ export function createWorkerRuntime(input: {
     async status(id) {
       await ready;
       if (id.startsWith("wrk_")) return workerSnapshot(requiredWorker(id as WorkerId));
-      if (id.startsWith("trn_")) return turnSnapshot(requiredTurn(id as TurnId), await progressOf(id as TurnId));
+      if (id.startsWith("trn_")) {
+        const turnId = id as TurnId;
+        const progress = await progressOf(turnId);
+        return turnSnapshot(requiredTurn(turnId), progress);
+      }
       throw new RuntimeError("INVALID_ID", `Expected a wrk_... or trn_... ID; received ${id}.`);
     },
 
@@ -423,13 +428,14 @@ export function createWorkerRuntime(input: {
   async function progressOf(turnId: TurnId): Promise<TurnProgress | undefined> {
     if (!input.client.turnProgress) return undefined;
     const turn = registry.getTurn(turnId);
-    if (!turn || turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed") {
-      return undefined;
-    }
+    if (!turn || turn.status !== "running") return undefined;
     const worker = registry.getWorker(turn.workerId);
     if (!worker) return undefined;
     try {
-      return await input.client.turnProgress(worker.sessionId, worker.directory);
+      const progress = await input.client.turnProgress(turnId, worker.sessionId, worker.directory);
+      const current = registry.getTurn(turnId);
+      if (!current || current.status !== "running") return undefined;
+      return progress;
     } catch {
       return undefined;
     }
