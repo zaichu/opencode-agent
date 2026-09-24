@@ -416,6 +416,147 @@ test("stalled child SSE activity still times out", async () => {
   }
 });
 
+test("a slow polling request does not delay the turn timeout", async () => {
+  const openCode = startFakeOpenCode({
+    pollMessagesDelayMs: 200,
+    onPrompt() {},
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 80, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const started = Date.now();
+    await expect(
+      client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_33333333333333333333333333333333",
+        { message: "poll timeout" },
+        new AbortController().signal,
+        "turn-poll-timeout",
+      ),
+    ).rejects.toMatchObject({ code: "OPENCODE_TURN_TIMEOUT", retryable: true });
+    expect(openCode.pollMessageRequests).toBe(1);
+    expect(Date.now() - started).toBeLessThan(160);
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("failed or empty polling responses do not count as progress", async () => {
+  let mode: "failed" | "empty" = "empty";
+  const openCode = startFakeOpenCode({
+    pollMessagesStatus: () => (mode === "failed" ? 500 : 200),
+    pollMessagesResponse: (session) => (mode === "empty" ? [] : session?.messages ?? []),
+    onPrompt(context) {
+      context.session.status = "idle";
+      context.addUser();
+      mode = "failed";
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 180, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const pending = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_44444444444444444444444444444444",
+      { message: "failed polling" },
+      new AbortController().signal,
+      "turn-failed-polling",
+    );
+    pending.catch(() => {});
+    await Bun.sleep(50);
+    const first = await client.turnProgress("turn-failed-polling", session, process.cwd());
+    mode = "empty";
+    await Bun.sleep(50);
+    const second = await client.turnProgress("turn-failed-polling", session, process.cwd());
+    expect(openCode.pollMessageRequests).toBeGreaterThan(0);
+    expect(second?.lastActivityAt).toBe(first?.lastActivityAt);
+    await expect(pending).rejects.toMatchObject({ code: "OPENCODE_TURN_TIMEOUT", retryable: true });
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("polling catches child activity missed by SSE", async () => {
+  let openCode!: FakeOpenCode;
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.status = "idle";
+      context.addUser();
+      const child = openCode.session("polled-child", process.cwd(), context.session.id, false);
+      void (async () => {
+        for (let index = 0; index < 6; index++) {
+          await Bun.sleep(25);
+          addPolledMessage(child, index, "bash");
+        }
+        await Bun.sleep(10);
+        const assistant = context.addAssistant({ text: "parent done after polling" });
+        context.complete(assistant);
+      })();
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 80, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const result = await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_55555555555555555555555555555555",
+      { message: "polled child" },
+      new AbortController().signal,
+      "turn-polled-child",
+    );
+    expect(result).toBe("parent done after polling");
+    expect(openCode.pollMessageRequests).toBeGreaterThan(0);
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("polling finds descendants beyond the first hundred sessions", async () => {
+  let secondContext: PromptContext | undefined;
+  let openCode!: FakeOpenCode;
+  openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.status = "idle";
+      context.addUser();
+      const children: FakeSession[] = [];
+      for (let index = 0; index <= 100; index++) {
+        children.push(openCode.session(`many-child-${index}`, process.cwd(), context.session.id, false));
+      }
+      addPolledMessage(children[100]!, 1, "bash");
+      secondContext = context;
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 1_000, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const pending = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_66666666666666666666666666666666",
+      { message: "many descendants" },
+      new AbortController().signal,
+      "turn-many-descendants",
+    );
+    pending.catch(() => {});
+    await Bun.sleep(200);
+    const progress = await client.turnProgress("turn-many-descendants", session, process.cwd());
+    expect(progress?.lastTool).toBe("bash");
+    if (!secondContext) throw new Error("prompt did not create descendants");
+    const assistant = secondContext.addAssistant({ text: "many descendants complete" });
+    secondContext.complete(assistant);
+    await expect(pending).resolves.toBe("many descendants complete");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
 test("turn progress summarizes subagent activity", async () => {
   let parentId = "";
   const openCode = startFakeOpenCode({
@@ -483,6 +624,18 @@ test("progress events (busy) postpone the timeout", async () => {
     openCode.stop();
   }
 });
+
+function addPolledMessage(session: FakeSession, index: number, tool: string): void {
+  session.messages.push({
+    info: {
+      id: `${session.id}-polled-message-${index}`,
+      sessionID: session.id,
+      role: "assistant",
+      time: { created: Date.now() },
+    },
+    parts: [{ id: `${session.id}-polled-part-${index}`, type: "tool", tool }],
+  });
+}
 
 function emitStep(openCode: FakeOpenCode, session: FakeSession, step: number, tool?: string): void {
   const messageID = `${session.id}-message-${step}`;

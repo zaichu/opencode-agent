@@ -34,13 +34,19 @@ export interface FakeOpenCodeScenario {
   onPermissionReply?(requestId: string): void | Promise<void>;
   statusResponse?(sessions: ReadonlyMap<string, FakeSession>): unknown;
   messagesResponse?(session: FakeSession | undefined): unknown;
+  pollMessagesResponse?(session: FakeSession | undefined): unknown;
+  pollMessagesStatus?(session: FakeSession | undefined): number | undefined;
+  pollMessagesDelayMs?: number;
+  childrenStatus?(sessionId: string): number | undefined;
+  childrenDelayMs?: number;
 }
 
 export interface FakeOpenCode {
   readonly url: string;
   readonly approvals: string[];
   readonly submissions: number;
-  session(id: string, directory?: string, parentID?: string): FakeSession;
+  readonly pollMessageRequests: number;
+  session(id: string, directory?: string, parentID?: string, emitCreated?: boolean): FakeSession;
   emit(type: string, properties: Record<string, unknown>): void;
   touch(id: string): FakeSession;
   stop(): void;
@@ -50,6 +56,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
   let nextSession = 0;
   let nextAssistant = 0;
   let submissions = 0;
+  let pollMessageRequests = 0;
   const approvals: string[] = [];
   const sessions = new Map<string, FakeSession>();
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
@@ -99,6 +106,9 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
       if (request.method === "GET" && childrenMatch) {
         const parentId = decodeURIComponent(childrenMatch[1]!);
         const directory = url.searchParams.get("directory") ?? "";
+        if (scenario.childrenDelayMs) await Bun.sleep(scenario.childrenDelayMs);
+        const status = scenario.childrenStatus?.(parentId);
+        if (status && status !== 200) return new Response("children failed", { status });
         const children = [...sessions.values()].filter(
           (session) => session.parentID === parentId && (!directory || session.directory === directory),
         );
@@ -142,6 +152,15 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
         if (session && url.searchParams.get("directory") !== session.directory) {
           return new Response("wrong directory", { status: 400 });
         }
+        if (url.searchParams.has("limit")) {
+          pollMessageRequests++;
+          if (scenario.pollMessagesDelayMs) await Bun.sleep(scenario.pollMessagesDelayMs);
+          const status = scenario.pollMessagesStatus?.(session);
+          if (status && status !== 200) return new Response("poll failed", { status });
+          const value = scenario.pollMessagesResponse?.(session) ?? session?.messages ?? [];
+          const limit = Math.max(1, Number(url.searchParams.get("limit")) || 1);
+          return Response.json(Array.isArray(value) ? value.slice(-limit) : value);
+        }
         return Response.json(scenario.messagesResponse?.(session) ?? session?.messages ?? []);
       }
       const permission = url.pathname.match(/^\/permission\/([^/]+)\/reply$/);
@@ -169,7 +188,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     },
   });
 
-  function session(id: string, directory = process.cwd(), parentID?: string): FakeSession {
+  function session(id: string, directory = process.cwd(), parentID?: string, emitCreated = true): FakeSession {
     let value = sessions.get(id);
     const created = !value;
     if (!value) {
@@ -178,7 +197,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     } else if (parentID !== undefined) {
       value.parentID = parentID;
     }
-    if (created) emit("session.created", { info: toSessionPayload(value) });
+    if (created && emitCreated) emit("session.created", { info: toSessionPayload(value) });
     return value;
   }
 
@@ -273,6 +292,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     url: `http://127.0.0.1:${port}`,
     approvals,
     get submissions() { return submissions; },
+    get pollMessageRequests() { return pollMessageRequests; },
     session,
     emit,
     touch,
