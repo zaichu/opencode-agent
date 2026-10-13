@@ -1,12 +1,18 @@
 export interface FakeMessage {
-  info: Record<string, any>;
-  parts: Array<Record<string, any>>;
+  id: string;
+  type: string;
+  time: { created: number; streamed?: number; completed?: number };
+  text?: string;
+  content?: Array<Record<string, any>>;
+  finish?: string;
+  outcome?: string;
+  error?: unknown;
 }
 
 export interface FakeSession {
   id: string;
   directory: string;
-  status: "idle" | "busy" | "retry";
+  busy: boolean;
   messages: FakeMessage[];
   parentID?: string;
   updatedAt: number;
@@ -20,19 +26,20 @@ export interface PromptContext {
   addAssistant(input: {
     id?: string;
     text?: string;
-    parts?: Array<Record<string, any>>;
+    content?: Array<Record<string, any>>;
     finish?: string;
     completed?: boolean;
   }): FakeMessage;
-  emit(type: string, properties: Record<string, unknown>): void;
-  emitMessage(message: FakeMessage): void;
-  complete(message: FakeMessage, emitIdle?: boolean): void;
+  emit(type: string, data: Record<string, unknown>, created?: number): void;
+  complete(message: FakeMessage, outcome?: string): void;
 }
 
 export interface FakeOpenCodeScenario {
   onPrompt?(context: PromptContext): void | Promise<void>;
   onPermissionReply?(requestId: string): void | Promise<void>;
-  statusResponse?(sessions: ReadonlyMap<string, FakeSession>): unknown;
+  activeResponse?(sessions: ReadonlyMap<string, FakeSession>): unknown;
+  // messagesResponse / pollMessagesResponse の配列は実 API と同じ降順(desc)で
+  // 返すこと。session.messages は昇順で保持しているため、そのまま渡すと逆順になる。
   messagesResponse?(session: FakeSession | undefined): unknown;
   pollMessagesResponse?(session: FakeSession | undefined): unknown;
   pollMessagesStatus?(session: FakeSession | undefined): number | undefined;
@@ -47,14 +54,14 @@ export interface FakeOpenCode {
   readonly submissions: number;
   readonly pollMessageRequests: number;
   session(id: string, directory?: string, parentID?: string, emitCreated?: boolean): FakeSession;
-  emit(type: string, properties: Record<string, unknown>): void;
+  emit(type: string, data: Record<string, unknown>, created?: number): void;
   touch(id: string): FakeSession;
   stop(): void;
 }
 
 export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpenCode {
   let nextSession = 0;
-  let nextAssistant = 0;
+  let nextMessage = 0;
   let submissions = 0;
   let pollMessageRequests = 0;
   const approvals: string[] = [];
@@ -62,9 +69,9 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
   const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const encoder = new TextEncoder();
 
-  const emit = (type: string, properties: Record<string, unknown>): void => {
-    const data = encoder.encode(`data: ${JSON.stringify({ payload: { type, properties } })}\n\n`);
-    for (const stream of streams) stream.enqueue(data);
+  const emit = (type: string, data: Record<string, unknown>, created = Date.now()): void => {
+    const frame = encoder.encode(`data: ${JSON.stringify({ created, type, data })}\n\n`);
+    for (const stream of streams) stream.enqueue(frame);
   };
 
   const server = Bun.serve({
@@ -72,19 +79,17 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
-      if (request.method === "GET" && url.pathname === "/global/health") {
-        return Response.json({ healthy: true, version: "test" });
+      if (request.method === "GET" && url.pathname === "/api/info") {
+        return Response.json({ version: "test" });
       }
-      if (request.method === "GET" && url.pathname === "/global/event") {
+      if (request.method === "GET" && url.pathname === "/api/event") {
         let controller: ReadableStreamDefaultController<Uint8Array>;
         return new Response(
           new ReadableStream<Uint8Array>({
             start(value) {
               controller = value;
               streams.add(value);
-              value.enqueue(
-                encoder.encode('data: {"payload":{"type":"server.connected","properties":{}}}\n\n'),
-              );
+              value.enqueue(encoder.encode('data: {"type":"server.connected","data":{}}\n\n'));
             },
             cancel() {
               streams.delete(controller);
@@ -93,96 +98,134 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
           { headers: { "content-type": "text/event-stream" } },
         );
       }
-      if (request.method === "POST" && url.pathname === "/session") {
-        const id = `session-${++nextSession}`;
-        const directory = url.searchParams.get("directory") ?? "";
-        sessions.set(id, { id, directory, status: "idle", messages: [], updatedAt: Date.now() });
-        return Response.json({ id, directory });
+      if (request.method === "POST" && url.pathname === "/api/session") {
+        const body = (await request.json()) as { location?: { directory?: string }; title?: string; model?: Record<string, unknown> };
+        const id = `ses-${++nextSession}`;
+        const directory = body.location?.directory ?? "";
+        sessions.set(id, { id, directory, busy: false, messages: [], updatedAt: Date.now() });
+        return Response.json({
+          data: { id, directory, title: body.title, model: body.model, time: { created: Date.now(), updated: Date.now() } },
+        });
       }
-      if (request.method === "GET" && (url.pathname === "/permission" || url.pathname === "/question")) {
-        return Response.json([]);
-      }
-      const childrenMatch = url.pathname.match(/^\/session\/([^/]+)\/children$/);
-      if (request.method === "GET" && childrenMatch) {
-        const parentId = decodeURIComponent(childrenMatch[1]!);
+      if (request.method === "GET" && url.pathname === "/api/session") {
+        const parentID = url.searchParams.get("parentID") ?? undefined;
         const directory = url.searchParams.get("directory") ?? "";
-        if (scenario.childrenDelayMs) await Bun.sleep(scenario.childrenDelayMs);
-        const status = scenario.childrenStatus?.(parentId);
-        if (status && status !== 200) return new Response("children failed", { status });
-        const children = [...sessions.values()].filter(
-          (session) => session.parentID === parentId && (!directory || session.directory === directory),
-        );
-        return Response.json(children.map(toSessionPayload));
-      }
-      if (request.method === "GET" && url.pathname === "/session") {
-        const directory = url.searchParams.get("directory") ?? "";
+        if (parentID) {
+          if (scenario.childrenDelayMs) await Bun.sleep(scenario.childrenDelayMs);
+          const status = scenario.childrenStatus?.(parentID);
+          if (status && status !== 200) return new Response("children failed", { status });
+        }
         const listed = [...sessions.values()].filter(
-          (session) => !directory || session.directory === directory,
+          (session) =>
+            (!parentID || session.parentID === parentID) && (!directory || session.directory === directory),
         );
-        return Response.json(listed.map(toSessionPayload));
+        return Response.json({ data: listed.map(sessionPayload), cursor: { previous: null, next: null } });
       }
-      if (request.method === "GET" && url.pathname === "/session/status") {
-        return Response.json(
-          scenario.statusResponse?.(sessions) ??
-            Object.fromEntries([...sessions].map(([id, session]) => [id, { type: session.status }])),
-        );
+      if (request.method === "GET" && url.pathname === "/api/session/active") {
+        const value =
+          scenario.activeResponse?.(sessions) ??
+          Object.fromEntries(
+            [...sessions.values()].filter((session) => session.busy).map((session) => [session.id, { type: "running" }]),
+          );
+        return Response.json({ data: value });
       }
-
-      const promptMatch = url.pathname.match(/^\/session\/([^/]+)\/prompt_async$/);
+      const sessionMatch = url.pathname.match(/^\/api\/session\/([^/]+)$/);
+      if (sessionMatch) {
+        const id = decodeURIComponent(sessionMatch[1]!);
+        const session = sessions.get(id);
+        if (session && request.method === "DELETE") {
+          sessions.delete(id);
+          return new Response(null, { status: 204 });
+        }
+        if (session && request.method === "POST" && !url.pathname.match(/\/(prompt|agent|model|interrupt|permission)/)) {
+          return new Response(null, { status: 204 });
+        }
+        return new Response("not found", { status: 404 });
+      }
+      const activeMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/(agent|model)$/);
+      if (request.method === "POST" && activeMatch) {
+        if (!sessions.has(decodeURIComponent(activeMatch[1]!))) return new Response("not found", { status: 404 });
+        return new Response(null, { status: 204 });
+      }
+      const interruptMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/interrupt$/);
+      if (request.method === "POST" && interruptMatch) {
+        const id = decodeURIComponent(interruptMatch[1]!);
+        const session = sessions.get(id);
+        if (session) {
+          session.busy = false;
+          session.updatedAt = Date.now();
+          emit("session.execution.interrupted", { sessionID: id });
+        }
+        return Response.json({ interrupted: Boolean(session) });
+      }
+      const promptMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/prompt$/);
       if (request.method === "POST" && promptMatch) {
         const session = sessions.get(decodeURIComponent(promptMatch[1]!));
         if (!session) return new Response("not found", { status: 404 });
-        if (url.searchParams.get("directory") !== session.directory) {
-          return new Response("wrong directory", { status: 400 });
-        }
-        const body = (await request.json()) as {
-          messageID: string;
-          parts?: Array<{ type?: string; text?: string }>;
-        };
+        if (session.busy) return Response.json({ _tag: "ConflictError", message: "Session is busy." }, { status: 409 });
+        const body = (await request.json()) as { id: string; text: string; delivery?: string };
         submissions++;
-        const context = promptContext(session, body.messageID, body.parts?.find((part) => part.type === "text")?.text ?? "");
+        session.updatedAt = Date.now();
+        emit("session.inbox.enqueued", {
+          sessionID: session.id,
+          inboxID: body.id,
+          item: { type: "user", payload: { text: body.text }, delivery: body.delivery ?? "queue" },
+        });
+        emit("session.execution.started", { sessionID: session.id });
+        emit("session.inbox.delivered", { sessionID: session.id, inboxID: body.id });
+        const context = promptContext(session, body.id, body.text);
         if (scenario.onPrompt) await scenario.onPrompt(context);
         else void defaultPrompt(context);
-        return new Response(null, { status: 204 });
+        return Response.json({
+          data: {
+            id: body.id,
+            sessionID: session.id,
+            time: { created: Date.now() },
+            type: "user",
+            payload: { text: body.text },
+            delivery: body.delivery ?? "steer",
+          },
+        });
       }
-
-      const messages = url.pathname.match(/^\/session\/([^/]+)\/message$/);
-      if (request.method === "GET" && messages) {
-        const session = sessions.get(decodeURIComponent(messages[1]!));
-        if (session && url.searchParams.get("directory") !== session.directory) {
-          return new Response("wrong directory", { status: 400 });
+      const messageMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/message\/([^/]+)$/);
+      if (request.method === "GET" && messageMatch) {
+        const session = sessions.get(decodeURIComponent(messageMatch[1]!));
+        const messageId = decodeURIComponent(messageMatch[2]!);
+        const entry = session?.messages.find((message) => message.id === messageId);
+        if (!entry) {
+          return Response.json({ _tag: "MessageNotFoundError", messageID: messageId }, { status: 404 });
         }
+        return Response.json({ data: entry });
+      }
+      const messagesMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/message$/);
+      if (request.method === "GET" && messagesMatch) {
+        const session = sessions.get(decodeURIComponent(messagesMatch[1]!));
         if (url.searchParams.has("limit")) {
           pollMessageRequests++;
           if (scenario.pollMessagesDelayMs) await Bun.sleep(scenario.pollMessagesDelayMs);
           const status = scenario.pollMessagesStatus?.(session);
           if (status && status !== 200) return new Response("poll failed", { status });
-          const value = scenario.pollMessagesResponse?.(session) ?? session?.messages ?? [];
+          const configured = scenario.pollMessagesResponse?.(session);
+          const value = configured ?? [...(session?.messages ?? [])].reverse();
           const limit = Math.max(1, Number(url.searchParams.get("limit")) || 1);
-          return Response.json(Array.isArray(value) ? value.slice(-limit) : value);
+          const list = Array.isArray(value) ? value.slice(0, limit) : value;
+          return Response.json({ data: list, cursor: { previous: null, next: null } });
         }
-        return Response.json(scenario.messagesResponse?.(session) ?? session?.messages ?? []);
+        const configured = scenario.messagesResponse?.(session);
+        return Response.json({
+          data: configured ?? [...(session?.messages ?? [])].reverse(),
+          cursor: { previous: null, next: null },
+        });
       }
-      const permission = url.pathname.match(/^\/permission\/([^/]+)\/reply$/);
-      if (request.method === "POST" && permission) {
-        const requestId = decodeURIComponent(permission[1]!);
+      if (request.method === "GET" && url.pathname === "/api/permission/request") {
+        return Response.json({ location: { directory: "" }, data: [] });
+      }
+      const permissionMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/permission\/([^/]+)\/reply$/);
+      if (request.method === "POST" && permissionMatch) {
+        const requestId = decodeURIComponent(permissionMatch[2]!);
         approvals.push(requestId);
         await scenario.onPermissionReply?.(requestId);
-        return Response.json(true);
-      }
-      if (request.method === "POST" && /^\/question\/[^/]+\/reject$/.test(url.pathname)) {
-        return Response.json(true);
-      }
-      if (request.method === "POST" && /\/session\/[^/]+\/abort$/.test(url.pathname)) {
-        const id = decodeURIComponent(url.pathname.split("/")[2]!);
-        const session = sessions.get(id);
-        if (session) session.status = "idle";
-        emit("session.idle", { sessionID: id });
-        return Response.json(true);
-      }
-      if (request.method === "DELETE" && /\/session\/[^/]+$/.test(url.pathname)) {
-        sessions.delete(decodeURIComponent(url.pathname.slice("/session/".length)));
-        return Response.json(true);
+        return new Response(null, { status: 204 });
       }
       return new Response("not found", { status: 404 });
     },
@@ -192,12 +235,18 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     let value = sessions.get(id);
     const created = !value;
     if (!value) {
-      value = { id, directory, status: "idle", messages: [], parentID, updatedAt: Date.now() };
+      value = { id, directory, busy: false, messages: [], parentID, updatedAt: Date.now() };
       sessions.set(id, value);
     } else if (parentID !== undefined) {
       value.parentID = parentID;
     }
-    if (created && emitCreated) emit("session.created", { info: toSessionPayload(value) });
+    if (created && emitCreated) {
+      emit("session.created", {
+        sessionID: value.id,
+        parentID: value.parentID,
+        location: { directory: value.directory },
+      });
+    }
     return value;
   }
 
@@ -208,7 +257,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     return value;
   }
 
-  function toSessionPayload(session: FakeSession): Record<string, unknown> {
+  function sessionPayload(session: FakeSession): Record<string, unknown> {
     return {
       id: session.id,
       parentID: session.parentID,
@@ -217,62 +266,61 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     };
   }
 
-  function promptContext(current: FakeSession, messageId: string, prompt: string): PromptContext {
+  function promptContext(current: FakeSession, messageId: string, text: string): PromptContext {
     return {
       session: current,
       messageId,
-      prompt,
+      prompt: text,
       addUser() {
         const message: FakeMessage = {
-          info: { id: messageId, sessionID: current.id, role: "user", time: { created: Date.now() } },
-          parts: [{ type: "text", text: prompt }],
+          id: messageId,
+          type: "user",
+          time: { created: Date.now() },
+          text,
         };
         current.messages.push(message);
         current.updatedAt = Date.now();
-        emit("message.updated", { info: message.info });
         return message;
       },
       addAssistant(input) {
-        const info: Record<string, any> = {
-          id: input.id ?? `assistant-${++nextAssistant}`,
-          sessionID: current.id,
-          role: "assistant",
-          parentID: messageId,
-          time: { created: Date.now() },
-        };
-        if (input.finish) info.finish = input.finish;
-        if (input.completed) info.time.completed = Date.now();
         const message: FakeMessage = {
-          info,
-          parts: input.parts ?? (input.text === undefined ? [] : [{ type: "text", text: input.text }]),
+          id: input.id ?? `msg-fake-${++nextMessage}`,
+          type: "assistant",
+          time: { created: Date.now(), ...(input.completed ? { completed: Date.now() } : {}) },
+          content:
+            input.content ??
+            (input.text === undefined ? [] : [{ type: "text", text: input.text }]),
+          finish: input.finish,
         };
+        if (input.finish === undefined) delete message.finish;
         current.messages.push(message);
         current.updatedAt = Date.now();
         return message;
       },
       emit,
-      emitMessage(message) {
-        emit("message.updated", { info: message.info });
-      },
-      complete(message, emitIdle = true) {
-        message.info.time.completed = Date.now();
-        message.info.finish ??= "stop";
-        current.status = "idle";
+      complete(message: FakeMessage, outcome = "succeeded") {
+        message.finish ??= "stop";
+        message.time.completed = Date.now();
+        current.busy = false;
         current.updatedAt = Date.now();
-        emit("message.updated", { info: message.info });
-        if (emitIdle) emit("session.idle", { sessionID: current.id });
+        emit("session.step.ended", { sessionID: current.id, assistantMessageID: message.id, finish: message.finish });
+        current.messages.push({
+          id: `msg-fake-idle-${++nextMessage}`,
+          type: "idle",
+          time: { created: Date.now() },
+          outcome,
+        });
+        emit(`session.execution.${outcome}`, { sessionID: current.id });
       },
     };
   }
 
   async function defaultPrompt(context: PromptContext): Promise<void> {
     await Bun.sleep(15);
-    context.session.status = "busy";
+    context.session.busy = true;
     context.addUser();
-    if (context.prompt === "WAIT-FOR-INTERRUPT") return;
     const remembered = context.session.messages
-      .flatMap((message) => message.parts)
-      .map((part) => String(part.text ?? ""))
+      .map((message) => message.text ?? "")
       .join("\n")
       .match(/BLUE-\d+/)?.[0];
     const text = context.prompt.includes("What code did I ask you to remember")
@@ -281,7 +329,6 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
         ? "READY"
         : `reply: ${context.prompt}`;
     const assistant = context.addAssistant({ text });
-    context.emitMessage(assistant);
     await Bun.sleep(context.prompt.includes("8675309") ? 1_000 : 15);
     context.complete(assistant);
   }

@@ -5,39 +5,33 @@ export interface TurnProgress {
   lastTool?: string;
 }
 
+// /api/session/{id}/message が返す章立て済みメッセージ(v2)。assistant は1turnで
+// 複数作られ、turn の完了は type:"idle" のマーカー(outcome 付き)で示される。
+interface MessageEntry {
+  id: string;
+  type?: string;
+  content?: Array<Record<string, unknown>>;
+  outcome?: string;
+  error?: unknown;
+  time?: { created?: number; streamed?: number; completed?: number };
+}
+
 interface SessionInfo {
   id: string;
   parentID?: string;
   time?: { created?: number };
 }
 
-interface MessagePart {
+interface PermissionRequest {
   id?: string;
-  type?: string;
-  text?: string;
-  tool?: string;
-  time?: { start?: number; end?: number };
+  sessionID?: string;
 }
 
-interface MessageEnvelope {
-  info: {
-    id: string;
-    sessionID?: string;
-    role: "user" | "assistant";
-    parentID?: string;
-    time?: { created?: number; completed?: number };
-    finish?: string;
-    error?: unknown;
-  };
-  parts: MessagePart[];
-}
-
-interface MessageSnapshot {
-  fingerprint: string;
-  messageID?: string;
-  createdAt?: number;
-  tool?: string;
-}
+type TurnScan =
+  | { status: "unadmitted" }
+  | { status: "running" }
+  | { status: "unresolved" }
+  | { status: "done"; text: string };
 
 export interface OpenCodePort {
   createSession(input: { directory: string; label?: string }): Promise<string>;
@@ -73,7 +67,6 @@ interface PendingTurn {
   readonly stepKeys: Set<string>;
   readonly activeSessions: Set<string>;
   readonly descendantIds: Set<string>;
-  readonly observedMessageIds: Set<string>;
   readonly messageSnapshots: Map<string, MessageSnapshot>;
   readonly lastActivityBySession: Map<string, number>;
   readonly pollPrioritySessionIds: Set<string>;
@@ -81,6 +74,14 @@ interface PendingTurn {
   pollMessageCursor: number;
   polling?: Promise<void>;
   lastTool?: string;
+}
+
+interface MessageSnapshot {
+  fingerprint: string;
+  messageID?: string;
+  createdAt?: number;
+  type?: string;
+  tool?: string;
 }
 
 class OpenCodeFailure extends Error {
@@ -93,107 +94,158 @@ class OpenCodeFailure extends Error {
   }
 }
 
+// v2 の /api 配下は Basic 認証(ユーザー名 "opencode"、パスワードは serve が生成
+// するトークン)。serve 自分起動時は OPENCODE_PASSWORD 環境変数でパスワードを固定
+// して渡すため stdout 解析は不要。既存サーバーへ外部接続する場合も同じ環境変数を
+// クライアント側で参照する。
+class Auth {
+  private header?: string;
+
+  constructor(password?: string) {
+    this.set(password);
+  }
+
+  set(password?: string): void {
+    this.header = password === undefined ? undefined : `Basic ${btoa(`opencode:${password}`)}`;
+  }
+
+  get authorization(): string | undefined {
+    return this.header;
+  }
+}
+
 class OpenCodeClient {
-  constructor(private readonly baseUrl = "http://127.0.0.1:4096") {}
+  private readonly headers: Record<string, string>;
+
+  constructor(
+    private readonly baseUrl = "http://127.0.0.1:4096",
+    private readonly auth: Auth = new Auth(),
+  ) {
+    this.headers = { accept: "application/json" };
+  }
 
   async health(): Promise<boolean> {
     try {
       // listen していないポートへの接続が RST を返さずハングする環境があるため timeout 必須。
       // ここが固まると ensureServer がサーバ起動の判断へ進めなくなる。
-      const response = await fetch(new URL("/global/health", this.baseUrl), {
+      const response = await fetch(this.url("/info"), {
+        headers: this.headersOf(),
         signal: AbortSignal.timeout(2_000),
       });
-      if (!response.ok) return false;
-      return ((await response.json()) as { healthy?: unknown }).healthy === true;
+      // 401 は「稼働中だがパスワード不明」。ここで false にすると同一ポートに
+      // もう一台 serve を起動して衝突するだけなので稼働扱いにし、認証失敗は
+      // 後続リクエストの OPENCODE_UNAUTHORIZED で報告する。
+      return response.ok || response.status === 401;
     } catch {
       return false;
     }
   }
 
   async createSession(input: { directory: string; label?: string }): Promise<string> {
-    const url = new URL("/session", this.baseUrl);
-    url.searchParams.set("directory", input.directory);
-    const response = await this.request(url, {
-      method: "POST",
-      headers: JSON_HEADERS,
-      body: JSON.stringify(input.label ? { title: input.label } : {}),
-    });
-    const session = (await response.json()) as { id?: unknown };
-    if (typeof session.id !== "string") {
+    const body: Record<string, unknown> = { location: { directory: input.directory } };
+    if (input.label !== undefined) body.title = input.label;
+    const response = await this.request("/session", { method: "POST", body: JSON.stringify(body) });
+    const payload = await this.body(response);
+    const session = payload?.data as { id?: unknown } | undefined;
+    if (typeof session?.id !== "string") {
       throw new OpenCodeFailure("INVALID_OPENCODE_RESPONSE", "OpenCode returned a session without an ID.", false);
     }
     return session.id;
   }
 
-  async promptAsync(
-    sessionId: string,
-    directory: string,
-    messageId: string,
-    input: { message: string; agent?: string; model?: string },
-  ): Promise<void> {
-    const body: Record<string, unknown> = {
-      messageID: messageId,
-      parts: [{ type: "text", text: input.message }],
-    };
-    if (input.agent) body.agent = input.agent;
-    if (input.model) body.model = parseModel(input.model);
-    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/prompt_async`, directory), {
+  async promptAsync(sessionId: string, messageId: string, message: string): Promise<void> {
+    // delivery は常に queue。アダプタは1セッション1turnを保証するため、
+    // 実行待ちの差し込み(steer)は起きない。
+    await this.request(`/session/${encodeURIComponent(sessionId)}/prompt`, {
       method: "POST",
-      headers: JSON_HEADERS,
-      body: JSON.stringify(body),
+      body: JSON.stringify({ id: messageId, text: message, delivery: "queue" }),
     });
   }
 
-  async sessionStatus(sessionId: string, directory: string): Promise<"busy" | "idle" | "retry"> {
-    const response = await this.request(this.directoryUrl("/session/status", directory));
-    const statuses = await jsonObject(response, "session status");
-    const entry = statuses[sessionId];
-    if (entry === undefined) return "idle";
-    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid session status.");
-    const status = (entry as { type?: unknown }).type;
-    if (status !== "busy" && status !== "idle" && status !== "retry") {
-      invalidResponse("OpenCode returned an invalid session status.");
-    }
-    return status;
+  async switchAgent(sessionId: string, agent: string): Promise<void> {
+    await this.request(`/session/${encodeURIComponent(sessionId)}/agent`, {
+      method: "POST",
+      body: JSON.stringify({ agent }),
+    });
   }
 
+  async switchModel(sessionId: string, model: string): Promise<void> {
+    await this.request(`/session/${encodeURIComponent(sessionId)}/model`, {
+      method: "POST",
+      body: JSON.stringify({ model: parseModel(model) }),
+    });
+  }
+
+  async activeSessions(): Promise<Set<string>> {
+    const response = await this.request("/session/active");
+    const payload = await this.body(response);
+    const data = payload?.data as Record<string, unknown> | undefined;
+    const running = new Set<string>();
+    for (const [sessionId, entry] of data && typeof data === "object" ? Object.entries(data) : []) {
+      if ((entry as { type?: unknown } | undefined)?.type === "running") running.add(sessionId);
+    }
+    return running;
+  }
+
+  // /api/session は既定で最新50件しか返さないため、子孫の列挙は cursor を辿る。
   async sessionChildren(sessionId: string, directory: string, timeoutMs: number): Promise<SessionInfo[]> {
-    const response = await this.request(
-      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/children`, directory),
-      { signal: AbortSignal.timeout(timeoutMs) },
-    );
-    return sessionList(await response.json());
-  }
-
-  async latestMessages(
-    sessionId: string,
-    directory: string,
-    limit: number,
-    timeoutMs: number,
-  ): Promise<MessageEnvelope[]> {
-    const url = this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory);
-    url.searchParams.set("limit", String(limit));
-    const response = await this.request(url, { signal: AbortSignal.timeout(timeoutMs) });
-    return messageList(await response.json());
-  }
-
-  async findAssistant(sessionId: string, directory: string, userMessageId: string): Promise<MessageEnvelope | null> {
-    const messages = await this.messages(sessionId, directory);
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const message = messages[index]!;
-      if (message.info.role === "assistant" && message.info.parentID === userMessageId) return message;
+    const children: SessionInfo[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 20; page++) {
+      const url = this.url("/session");
+      url.searchParams.set("parentID", sessionId);
+      url.searchParams.set("directory", directory);
+      url.searchParams.set("limit", "100");
+      if (cursor) url.searchParams.set("cursor", cursor);
+      const response = await this.requestUrl(url, { signal: AbortSignal.timeout(timeoutMs) });
+      const payload = await this.body(response);
+      children.push(...sessionList(payload?.data));
+      const next = (payload?.cursor as { next?: unknown } | undefined)?.next;
+      if (typeof next !== "string") break;
+      cursor = next;
     }
-    return null;
+    return children;
   }
 
-  async hasUserMessage(sessionId: string, directory: string, messageId: string): Promise<boolean> {
-    return (await this.messages(sessionId, directory)).some(
-      (message) => message.info.role === "user" && message.info.id === messageId,
-    );
+  // 最新(limit件、降順)ページだけ取得する進捗ポーリング用。
+  async latestMessages(sessionId: string, limit: number, timeoutMs: number): Promise<MessageEntry[]> {
+    const url = this.url(`/session/${encodeURIComponent(sessionId)}/message`);
+    url.searchParams.set("limit", String(limit));
+    const response = await this.requestUrl(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const payload = await this.body(response);
+    return messageList(payload?.data).reverse();
+  }
+
+  // メッセージ一覧は新しい順(desc)。既定ページサイズで打ち切られるため
+  // cursor で1ページずつ辿る。
+  async messagePage(sessionId: string, cursor?: string): Promise<{ entries: MessageEntry[]; next?: string }> {
+    const url = this.url(`/session/${encodeURIComponent(sessionId)}/message`);
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const response = await this.requestUrl(url, {});
+    const payload = await this.body(response);
+    const next = (payload?.cursor as { next?: unknown } | undefined)?.next;
+    return { entries: messageList(payload?.data), next: typeof next === "string" ? next : undefined };
+  }
+
+  async findMessage(sessionId: string, messageId: string): Promise<MessageEntry | null> {
+    let response: Response;
+    try {
+      response = await this.requestUrl(
+        this.url(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`),
+        {},
+      );
+    } catch (error) {
+      // 未 admitted の user メッセージは 404({_tag: "MessageNotFoundError"})で返る。
+      // 失敗ではなく precheck の「まだ persist されていない」判定に使う。
+      if (error instanceof OpenCodeFailure && error.code === "OPENCODE_NOT_FOUND") return null;
+      throw error;
+    }
+    const payload = await this.body(response);
+    return messageEntry(payload?.data);
   }
 
   async openGlobalEvents(signal: AbortSignal): Promise<Response> {
-    const response = await this.request(new URL("/global/event", this.baseUrl), {
+    const response = await this.requestUrl(this.url("/event"), {
       headers: { accept: "text/event-stream" },
       signal,
     });
@@ -203,46 +255,63 @@ class OpenCodeClient {
     return response;
   }
 
-  async pendingPermissions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
-    const response = await this.request(this.directoryUrl("/permission", directory));
-    return requestList(await response.json(), "permission");
-  }
-
-  async approvePermission(requestId: string, directory: string): Promise<void> {
-    await this.request(this.directoryUrl(`/permission/${encodeURIComponent(requestId)}/reply`, directory), {
-      method: "POST",
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ reply: "once" }),
+  async pendingPermissions(): Promise<PermissionRequest[]> {
+    const response = await this.request("/permission/request");
+    const payload = await this.body(response);
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    return data.map((entry: unknown) => {
+      const value = entry as PermissionRequest;
+      return {
+        id: typeof value?.id === "string" ? value.id : undefined,
+        sessionID: typeof value?.sessionID === "string" ? value.sessionID : undefined,
+      };
     });
   }
 
-  async pendingQuestions(directory: string): Promise<Array<{ id?: string; sessionID?: string }>> {
-    const response = await this.request(this.directoryUrl("/question", directory));
-    return requestList(await response.json(), "question");
+  async approvePermission(requestId: string, sessionId: string): Promise<void> {
+    await this.request(
+      `/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`,
+      { method: "POST", body: JSON.stringify({ decision: "once" }) },
+    );
   }
 
-  async rejectQuestion(requestId: string, directory: string): Promise<void> {
-    await this.request(this.directoryUrl(`/question/${encodeURIComponent(requestId)}/reject`, directory), {
-      method: "POST",
-    });
+  async abort(sessionId: string): Promise<void> {
+    await this.request(`/session/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
   }
 
-  async abort(sessionId: string, directory: string): Promise<void> {
-    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/abort`, directory), {
-      method: "POST",
-    });
+  async close(sessionId: string): Promise<void> {
+    await this.request(`/session/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   }
 
-  async close(sessionId: string, directory: string): Promise<void> {
-    await this.request(this.directoryUrl(`/session/${encodeURIComponent(sessionId)}`, directory), {
-      method: "DELETE",
-    });
+  private async request(
+    path: string,
+    init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> } = {},
+  ): Promise<Response> {
+    const response = await this.requestUrl(this.url(path), init);
+    if (response.status === 404) {
+      const detail = (await response.text()).trim().slice(0, 4096);
+      throw new OpenCodeFailure(
+        "OPENCODE_NOT_FOUND",
+        `OpenCode ${init.method ?? "GET"} ${path} failed (404)${detail ? `: ${detail}` : ""}`,
+        false,
+      );
+    }
+    return response;
   }
 
-  private async request(url: URL, init: RequestInit = {}): Promise<Response> {
+  private async body(response: Response): Promise<(Record<string, unknown> & { data?: unknown }) | undefined> {
+    const value: unknown = await response.json();
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    return value as Record<string, unknown> & { data?: unknown };
+  }
+
+  private async requestUrl(
+    url: URL,
+    init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> },
+  ): Promise<Response> {
     let response: Response;
     try {
-      response = await fetch(url, init);
+      response = await fetch(url, { ...init, headers: { ...this.headersOf(), ...init.headers } });
     } catch (error) {
       if (init.signal?.aborted) {
         throw new OpenCodeFailure("TURN_INTERRUPTED", "The OpenCode turn was interrupted.", false);
@@ -254,6 +323,13 @@ class OpenCodeClient {
       );
     }
 
+    if (response.status === 401) {
+      throw new OpenCodeFailure(
+        "OPENCODE_UNAUTHORIZED",
+        `OpenCode at ${this.baseUrl} requires authentication. Set OPENCODE_PASSWORD to the server password.`,
+        false,
+      );
+    }
     if (!response.ok) {
       const detail = (await response.text()).trim().slice(0, 4096);
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
@@ -268,17 +344,14 @@ class OpenCodeClient {
     return response;
   }
 
-  private directoryUrl(path: string, directory: string): URL {
-    const url = new URL(path, this.baseUrl);
-    url.searchParams.set("directory", directory);
-    return url;
+  private headersOf(): Record<string, string> {
+    const authorization = this.auth.authorization;
+    return authorization === undefined ? this.headers : { ...this.headers, authorization };
   }
 
-  async messages(sessionId: string, directory: string): Promise<MessageEnvelope[]> {
-    const response = await this.request(
-      this.directoryUrl(`/session/${encodeURIComponent(sessionId)}/message`, directory),
-    );
-    return messageList(await response.json());
+  // v2 の全ルートは /api 配下なので、呼び出し側は resource パスだけ渡す。
+  private url(path: string): URL {
+    return new URL(`/api${path}`, this.baseUrl);
   }
 }
 
@@ -290,19 +363,32 @@ const DEFAULT_POLL_MESSAGE_LIMIT = 20;
 const DEFAULT_ACTIVE_SESSION_TTL_MS = 60_000;
 const POLL_MESSAGE_LIMIT = 1;
 
+function passwordFromEnvironment(): string | undefined {
+  return Bun.env.OPENCODE_PASSWORD ?? Bun.env.OPENCODE_SERVER_PASSWORD;
+}
+
+function randomPassword(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
 export class ManagedOpenCode implements OpenCodePort {
+  private readonly auth: Auth;
   private readonly client: OpenCodeClient;
   private readonly eventAbort = new AbortController();
   private readonly pending = new Map<string, PendingTurn>();
   private readonly pendingByTurn = new Map<string, PendingTurn>();
   private readonly sessionParents = new Map<string, string>();
   private readonly sessionTurns = new Map<string, string>();
+  private readonly appliedAgentBySession = new Map<string, string>();
+  private readonly appliedModelBySession = new Map<string, string>();
   private child?: ReturnType<typeof Bun.spawn>;
   private starting?: Promise<void>;
   private eventsReady?: Promise<void>;
   private reconnecting?: Promise<void>;
   private stopped = false;
   private readonly timeoutTimer: ReturnType<typeof setInterval>;
+  private readonly password: string | undefined;
 
   constructor(
     private readonly baseUrl = "http://127.0.0.1:4096",
@@ -314,7 +400,12 @@ export class ManagedOpenCode implements OpenCodePort {
     private readonly pollMessageLimit = DEFAULT_POLL_MESSAGE_LIMIT,
     private readonly activeSessionTtlMs = DEFAULT_ACTIVE_SESSION_TTL_MS,
   ) {
-    this.client = new OpenCodeClient(baseUrl);
+    // 外部接続のときは環境変数のパスワード、自分で起動するときは固定パスワードを
+    // 生成する。乱数パスワードは子プロセスに OPENCODE_PASSWORD として渡されるため
+    // stdout を解析する必要がない。
+    this.password = passwordFromEnvironment();
+    this.auth = new Auth(this.password);
+    this.client = new OpenCodeClient(baseUrl, this.auth);
     this.timeoutTimer = setInterval(() => {
       void this.checkTimeouts();
     }, timeoutCheckIntervalMs);
@@ -396,13 +487,8 @@ export class ManagedOpenCode implements OpenCodePort {
       }
       if (this.pending.get(pending.sessionId) !== pending) return;
       for (const child of children) {
-        if (child.id === pending.sessionId) continue;
-        if (isBeforeTurn(numberValue(child.time?.created), pending.startedAt)) continue;
-        const owner = this.sessionTurns.get(child.id);
-        if (owner && owner !== pending.turnId) continue;
-        this.sessionParents.set(child.id, parentId);
-        this.sessionTurns.set(child.id, pending.turnId);
-        pending.descendantIds.add(child.id);
+        // turn 開始前に作られた子は前turnの成果物。次の進捗に混ぜない。
+        if (!isBeforeTurn(child.time?.created, pending.startedAt)) this.adoptDescendant(pending, child.id);
       }
     }
   }
@@ -432,14 +518,9 @@ export class ManagedOpenCode implements OpenCodePort {
   }
 
   private async pollSessionMessages(pending: PendingTurn, sessionId: string): Promise<void> {
-    let messages: MessageEnvelope[];
+    let messages: MessageEntry[];
     try {
-      messages = await this.client.latestMessages(
-        sessionId,
-        pending.directory,
-        POLL_MESSAGE_LIMIT,
-        this.pollRequestTimeoutMs,
-      );
+      messages = await this.client.latestMessages(sessionId, POLL_MESSAGE_LIMIT, this.pollRequestTimeoutMs);
     } catch {
       return;
     }
@@ -450,22 +531,25 @@ export class ManagedOpenCode implements OpenCodePort {
     if (!snapshot.messageID) return;
     if (!previous) {
       const messageKey = messageStepKey(sessionId, snapshot.messageID);
-      if (
-        !pending.observedMessageIds.has(messageKey) &&
-        (snapshot.createdAt === undefined || snapshot.createdAt >= pending.startedAt)
-      ) {
+      const fresh = snapshot.createdAt === undefined || snapshot.createdAt >= pending.startedAt;
+      if (fresh && !pending.stepKeys.has(messageKey)) {
+        // ステップとして数えるのは assistant メッセージだけ(user プロンプトや
+        // idle マーカーは SSE の step.started に対応しない)。
         this.observeActivity(
           pending,
           sessionId,
           Date.now(),
-          messageKey,
+          snapshot.type === "assistant" ? messageKey : undefined,
           snapshot.tool,
         );
       }
       return;
     }
     if (previous.fingerprint === snapshot.fingerprint) return;
-    const stepKey = previous.messageID === snapshot.messageID ? undefined : messageStepKey(sessionId, snapshot.messageID);
+    const stepKey =
+      snapshot.type === "assistant" && previous.messageID !== snapshot.messageID
+        ? messageStepKey(sessionId, snapshot.messageID)
+        : undefined;
     this.observeActivity(pending, sessionId, Date.now(), stepKey, snapshot.tool);
   }
 
@@ -478,13 +562,21 @@ export class ManagedOpenCode implements OpenCodePort {
     turnId = sessionId,
   ): Promise<string> {
     await this.ensureRunning();
-    const existing = await this.client.findAssistant(sessionId, directory, messageId);
-    if (existing && isTerminalMessage(existing.info)) return resultText(existing);
-    const persisted = Boolean(existing) || (await this.client.hasUserMessage(sessionId, directory, messageId));
+    if (input.agent && this.appliedAgentBySession.get(sessionId) !== input.agent) {
+      await this.client.switchAgent(sessionId, input.agent);
+      this.appliedAgentBySession.set(sessionId, input.agent);
+    }
+    if (input.model && this.appliedModelBySession.get(sessionId) !== input.model) {
+      await this.client.switchModel(sessionId, input.model);
+      this.appliedModelBySession.set(sessionId, input.model);
+    }
+    const precheck = await this.findTurnResult(sessionId, messageId);
+    if (precheck.status === "done") return precheck.text;
+    const persisted = precheck.status !== "unadmitted";
     const pending = this.watch(turnId, sessionId, directory, messageId, signal, persisted);
-    if (existing) this.markObserved(pending);
+    if (persisted) this.markObserved(pending);
     try {
-      if (!persisted) await this.client.promptAsync(sessionId, directory, messageId, input);
+      if (!persisted) await this.client.promptAsync(sessionId, messageId, input.message);
       await this.refresh(pending);
       return await pending.promise;
     } catch (error) {
@@ -493,14 +585,64 @@ export class ManagedOpenCode implements OpenCodePort {
     }
   }
 
-  async abort(sessionId: string, directory: string): Promise<void> {
-    await this.ensureServer();
-    return this.client.abort(sessionId, directory);
+  // user メッセージを起点に、次の user メッセージまたは idle マーカーまでの
+  // assistant メッセージをその1つの成果物として読む。ランタイムはセッション毎に
+  // turn を直列化しているため、区間の中に別 turn のメッセージは入らない。
+  private async findTurnResult(sessionId: string, userMessageId: string): Promise<TurnScan> {
+    const userMessage = await this.client.findMessage(sessionId, userMessageId);
+    if (!userMessage) return { status: "unadmitted" };
+    // メッセージ一覧は新しい順・既定ページサイズ打ち切りのため、ページを辿りながら
+    // 対象の user メッセージ以降(= この turn の区間)だけを集める。
+    const collected: MessageEntry[] = [];
+    let cursor: string | undefined;
+    let admitted = false;
+    for (let page = 0; page < 20 && !admitted; page++) {
+      const { entries, next } = await this.client.messagePage(sessionId, cursor);
+      for (const message of entries) {
+        if (message.type === "user" && message.id === userMessageId) {
+          admitted = true;
+          break;
+        }
+        collected.push(message);
+      }
+      if (!next) break;
+      cursor = next;
+    }
+    // persist 済みの user メッセージがページ取得で見つからないのは不整合。再送は
+    // 重複になるため unadmitted にはせず、判別不能として扱う。
+    if (!admitted) return { status: "unresolved" };
+    const entries = collected.reverse();
+    const turn: MessageEntry[] = [];
+    for (const message of entries) {
+      if (message.type === "idle") {
+        const failed = turn.find((entry) => entry.error);
+        if (failed?.error) throw errorFromAssistant(failed.error);
+        if (message.outcome === "succeeded") return { status: "done", text: resultText(turn) };
+        // idle は実行終了。成功以外の outcome(failed/interrupted 等)を終了しない
+        // ものとして扱うと turn が timeout まで残るため、詳細不明でも失敗で返す。
+        if (typeof message.outcome === "string") {
+          throw new OpenCodeFailure(
+            "OPENCODE_TURN_FAILED",
+            `OpenCode turn ${userMessageId} in session ${sessionId} finished with outcome ${message.outcome}.`,
+            false,
+          );
+        }
+        return { status: "unresolved" };
+      }
+      if (message.type === "user" && message.id !== userMessageId) return { status: "unresolved" };
+      if (message.type === "assistant") turn.push(message);
+    }
+    return { status: "running" };
   }
 
-  async close(sessionId: string, directory: string): Promise<void> {
+  async abort(sessionId: string, _directory: string): Promise<void> {
     await this.ensureServer();
-    return this.client.close(sessionId, directory);
+    await this.client.abort(sessionId);
+  }
+
+  async close(sessionId: string, _directory: string): Promise<void> {
+    await this.ensureServer();
+    await this.client.close(sessionId);
   }
 
   async stop(): Promise<void> {
@@ -514,6 +656,8 @@ export class ManagedOpenCode implements OpenCodePort {
     this.pendingByTurn.clear();
     this.sessionParents.clear();
     this.sessionTurns.clear();
+    this.appliedAgentBySession.clear();
+    this.appliedModelBySession.clear();
 
     const child = this.child;
     this.child = undefined;
@@ -547,8 +691,11 @@ export class ManagedOpenCode implements OpenCodePort {
     }
 
     const port = url.port || "80";
+    const password = this.password ?? randomPassword();
+    this.auth.set(password);
     this.child = Bun.spawn({
       cmd: [this.executable, "serve", "--hostname", url.hostname, "--port", port],
+      env: { ...Bun.env, OPENCODE_PASSWORD: password },
       stdin: "ignore",
       stdout: "inherit",
       stderr: "inherit",
@@ -644,6 +791,7 @@ export class ManagedOpenCode implements OpenCodePort {
     }
   }
 
+  // v2 の SSE は {type, data} の1行 data JSON(v1 の {payload: {…}} ラップなし)。
   private handleEvent(data: string): void {
     if (!isRelevantEvent(data)) return;
     let value: unknown;
@@ -653,166 +801,109 @@ export class ManagedOpenCode implements OpenCodePort {
       return;
     }
     if (!value || typeof value !== "object") return;
-    const wrapper = value as { payload?: unknown; type?: unknown; properties?: unknown };
-    const payload =
-      wrapper.payload && typeof wrapper.payload === "object"
-        ? (wrapper.payload as { type?: unknown; properties?: unknown })
-        : wrapper;
-    if (typeof payload.type !== "string" || !payload.properties || typeof payload.properties !== "object") return;
-    const properties = payload.properties as Record<string, unknown>;
+    const event = value as { type?: unknown; data?: unknown; created?: unknown };
+    if (typeof event.type !== "string" || !event.data || typeof event.data !== "object") return;
+    const payload = event.data as Record<string, unknown>;
+    const sessionId = sessionIdOf(payload);
 
-    switch (payload.type) {
+    switch (event.type) {
       case "session.created":
-        this.handleSessionCreated(properties);
+        this.handleSessionCreated(payload, numberValue(event.created));
         break;
       case "permission.asked":
-      case "permission.v2.asked":
-        if (
-          typeof properties.id === "string" &&
-          typeof properties.sessionID === "string" &&
-          this.pending.has(properties.sessionID)
-        ) {
-          const pending = this.pending.get(properties.sessionID);
-          if (!pending) break;
-          void this.client.approvePermission(properties.id, pending.directory).catch((error) => {
-            this.failSession(properties.sessionID, error);
-          });
-        }
-        break;
-      case "question.asked":
-      case "question.v2.asked":
-        if (
-          typeof properties.id === "string" &&
-          typeof properties.sessionID === "string" &&
-          this.pending.has(properties.sessionID)
-        ) {
-          const pending = this.pending.get(properties.sessionID);
-          if (!pending) break;
-          void this.client.rejectQuestion(properties.id, pending.directory).catch((error) => {
-            this.failSession(properties.sessionID, error);
-          });
-        }
-        break;
-      case "message.updated":
-        this.handleMessageUpdated(properties);
-        break;
-      case "message.part.updated":
-        this.handlePartUpdated(properties);
-        break;
-      case "session.idle": {
-        if (typeof properties.sessionID !== "string") break;
-        const pending = this.pendingForSession(properties.sessionID);
+      case "permission.v2.asked": {
+        if (!sessionId || typeof payload.id !== "string") break;
+        const pending = this.pendingForSession(sessionId);
         if (!pending) break;
-        if (properties.sessionID === pending.sessionId) void this.refresh(pending);
-        else this.deactivate(pending, properties.sessionID);
+        this.observeActivity(pending, sessionId, Date.now(), `permission:${payload.id}`);
+        void this.client.approvePermission(payload.id, sessionId).catch((error) => {
+          this.failSession(sessionId, error);
+        });
+        break;
+      }
+      case "session.inbox.delivered": {
+        if (!sessionId) break;
+        const pending = this.pendingForSession(sessionId);
+        if (pending) this.observeActivity(pending, sessionId, Date.now());
+        break;
+      }
+      case "session.step.started": {
+        if (!sessionId) break;
+        const pending = this.pendingForSession(sessionId);
+        if (!pending) break;
+        const key =
+          typeof payload.assistantMessageID === "string"
+            ? messageStepKey(sessionId, payload.assistantMessageID)
+            : undefined;
+        this.observeActivity(pending, sessionId, numberValue(payload.started) ?? Date.now(), key);
+        break;
+      }
+      case "session.text.started":
+      case "session.reasoning.started":
+      case "session.tool.input.started": {
+        if (!sessionId) break;
+        const pending = this.pendingForSession(sessionId);
+        if (!pending) break;
+        const tool = typeof payload.name === "string" && payload.name ? payload.name : undefined;
+        this.observeActivity(pending, sessionId, Date.now(), undefined, tool);
+        break;
+      }
+      case "session.text.delta":
+      case "session.reasoning.delta":
+      case "session.tool.input.delta":
+      case "session.tool.called":
+      case "session.tool.progress":
+      case "session.tool.success":
+      case "session.tool.failed": {
+        if (!sessionId) break;
+        const pending = this.pendingForSession(sessionId);
+        if (pending) this.observeActivity(pending, sessionId, Date.now());
+        break;
+      }
+      case "session.execution.started":
+        break;
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.execution.interrupted": {
+        if (!sessionId) break;
+        const pending = this.pendingForSession(sessionId);
+        if (!pending) break;
+        if (sessionId === pending.sessionId) void this.refresh(pending).catch(() => undefined);
+        else this.deactivate(pending, sessionId);
         break;
       }
       case "session.status": {
-        if (typeof properties.sessionID !== "string" || !properties.status || typeof properties.status !== "object") {
-          break;
-        }
-        const pending = this.pendingForSession(properties.sessionID);
+        if (!sessionId || !payload.status || typeof payload.status !== "object") break;
+        const pending = this.pendingForSession(sessionId);
         if (!pending) break;
-        const type = (properties.status as { type?: unknown }).type;
-        if (type === "busy" || type === "retry") {
-          this.observeActivity(pending, properties.sessionID, Date.now());
-        } else if (type === "idle") {
-          if (properties.sessionID === pending.sessionId) void this.refresh(pending);
-          else this.deactivate(pending, properties.sessionID);
-        }
+        const type = (payload.status as { type?: unknown }).type;
+        if (type === "busy" || type === "retry") this.observeActivity(pending, sessionId, Date.now());
         break;
       }
       case "session.error":
-        this.failSession(properties.sessionID, errorFromAssistant(properties.error));
+        this.failSession(sessionId, errorFromAssistant(payload.error));
         break;
     }
   }
 
-  private handleSessionCreated(properties: Record<string, unknown>): void {
-    const info = properties.info;
-    if (!info || typeof info !== "object") return;
-    const session = info as { id?: unknown; parentID?: unknown; time?: { created?: unknown } };
-    if (typeof session.id !== "string") return;
-    const parentID = typeof session.parentID === "string" ? session.parentID : undefined;
+  private handleSessionCreated(payload: Record<string, unknown>, createdAt?: number): void {
+    if (typeof payload.sessionID !== "string") return;
+    const sessionId = payload.sessionID;
+    const parentID = typeof payload.parentID === "string" ? payload.parentID : undefined;
     const inheritedTurn = parentID ? this.sessionTurns.get(parentID) : undefined;
-    const turnId = inheritedTurn ?? this.pending.get(this.rootSession(session.id))?.turnId;
+    const turnId = inheritedTurn ?? this.pending.get(this.rootSession(sessionId))?.turnId;
     if (!turnId) return;
     const pending = this.pendingByTurn.get(turnId);
     if (!pending) return;
-    if (isBeforeTurn(numberValue(session.time?.created), pending.startedAt)) return;
-    if (parentID) this.sessionParents.set(session.id, parentID);
-    this.sessionTurns.set(session.id, turnId);
-    if (session.id !== pending.sessionId) pending.descendantIds.add(session.id);
-    this.observeActivity(pending, session.id, Date.now());
+    if (isBeforeTurn(createdAt, pending.startedAt)) return;
+    if (parentID) this.sessionParents.set(sessionId, parentID);
+    this.sessionTurns.set(sessionId, turnId);
+    if (sessionId !== pending.sessionId) pending.descendantIds.add(sessionId);
+    this.observeActivity(pending, sessionId, Date.now());
   }
 
-  private handleMessageUpdated(properties: Record<string, unknown>): void {
-    const info = properties.info;
-    if (!info || typeof info !== "object") return;
-    const message = info as {
-      id?: unknown;
-      sessionID?: unknown;
-      role?: unknown;
-      parentID?: unknown;
-      error?: unknown;
-      finish?: unknown;
-      time?: { created?: unknown; completed?: unknown };
-    };
-    const sessionId =
-      typeof message.sessionID === "string"
-        ? message.sessionID
-        : typeof properties.sessionID === "string"
-          ? properties.sessionID
-          : undefined;
-    if (!sessionId) return;
-    const pending = this.pendingForSession(sessionId);
-    if (!pending) return;
-    const at = numberValue(message.time?.completed ?? message.time?.created) ?? Date.now();
-    if (typeof message.id === "string") pending.observedMessageIds.add(messageStepKey(sessionId, message.id));
-    const stepKey =
-      message.role === "assistant" && typeof message.id === "string" ? messageStepKey(sessionId, message.id) : undefined;
-    this.observeActivity(pending, sessionId, at, stepKey);
-    if (
-      sessionId === pending.sessionId &&
-      message.role === "assistant" &&
-      message.parentID === pending.userMessageId &&
-      typeof message.id === "string"
-    ) {
-      if (message.error) this.rejectPending(pending, errorFromAssistant(message.error));
-      else if (isTerminalMessage(message)) void this.finish(sessionId);
-    }
-  }
-
-  private handlePartUpdated(properties: Record<string, unknown>): void {
-    const part = properties.part;
-    if (!part || typeof part !== "object") return;
-    const value = part as {
-      id?: unknown;
-      messageID?: unknown;
-      sessionID?: unknown;
-      type?: unknown;
-      tool?: unknown;
-    };
-    const sessionId =
-      typeof value.sessionID === "string"
-        ? value.sessionID
-        : typeof properties.sessionID === "string"
-          ? properties.sessionID
-          : undefined;
-    if (!sessionId) return;
-    const pending = this.pendingForSession(sessionId);
-    if (!pending) return;
-    const messageID = typeof value.messageID === "string" ? value.messageID : undefined;
-    if (messageID) pending.observedMessageIds.add(messageStepKey(sessionId, messageID));
-    const stepKey =
-      (value.type === "step-start" || value.type === "step-finish") && messageID
-        ? messageStepKey(sessionId, messageID)
-        : undefined;
-    const tool = typeof value.tool === "string" && value.tool ? value.tool : undefined;
-    this.observeActivity(pending, sessionId, numberValue(properties.time) ?? Date.now(), stepKey, tool);
-  }
-
-  private pendingForSession(sessionId: string): PendingTurn | undefined {
+  private pendingForSession(sessionId: string | undefined): PendingTurn | undefined {
+    if (typeof sessionId !== "string") return undefined;
     const turnId = this.sessionTurns.get(sessionId);
     if (turnId) return this.pendingByTurn.get(turnId);
     const rootId = this.rootSession(sessionId);
@@ -831,6 +922,12 @@ export class ManagedOpenCode implements OpenCodePort {
       current = parentID;
     }
     return current;
+  }
+
+  private adoptDescendant(pending: PendingTurn, sessionId: string): void {
+    if (this.sessionTurns.has(sessionId) || pending.descendantIds.has(sessionId)) return;
+    this.sessionTurns.set(sessionId, pending.turnId);
+    if (sessionId !== pending.sessionId) pending.descendantIds.add(sessionId);
   }
 
   private observeActivity(
@@ -914,7 +1011,6 @@ export class ManagedOpenCode implements OpenCodePort {
       stepKeys: new Set(),
       activeSessions: new Set(),
       descendantIds: new Set(),
-      observedMessageIds: new Set(),
       messageSnapshots: new Map(),
       lastActivityBySession: new Map(),
       pollPrioritySessionIds: new Set(),
@@ -937,27 +1033,29 @@ export class ManagedOpenCode implements OpenCodePort {
 
   private async refresh(pending: PendingTurn): Promise<void> {
     if (this.pending.get(pending.sessionId) !== pending || pending.finishing) return;
-    const assistant = await this.client.findAssistant(
-      pending.sessionId,
-      pending.directory,
-      pending.userMessageId,
-    );
-    if (this.pending.get(pending.sessionId) !== pending) return;
-    if (assistant) {
-      this.markObserved(pending);
-      if (assistant.info.error) {
-        this.rejectPending(pending, errorFromAssistant(assistant.info.error));
-        return;
-      }
-      if (isTerminalMessage(assistant.info)) {
-        this.resolvePending(pending, resultText(assistant));
-        return;
-      }
+    let scan: TurnScan;
+    try {
+      scan = await this.findTurnResult(pending.sessionId, pending.userMessageId);
+    } catch (error) {
+      this.rejectPending(pending, error);
+      return;
     }
-    const status = await this.client.sessionStatus(pending.sessionId, pending.directory);
-    if (status === "busy" || status === "retry") {
+    if (this.pending.get(pending.sessionId) !== pending) return;
+    if (scan.status === "done") {
       this.markObserved(pending);
-    } else if (pending.observed || pending.failIfIdleWithoutResult) {
+      this.resolvePending(pending, scan.text);
+      return;
+    }
+    if (scan.status === "running") {
+      const active = await this.client.activeSessions();
+      if (active.has(pending.sessionId)) this.markObserved(pending);
+      else if (pending.observed || pending.failIfIdleWithoutResult) await this.finish(pending.sessionId);
+      return;
+    }
+    // unadmitted: prompt がまだ persist されていない。開始直後の空振り。
+    // unresolved: 中断済み(実行が終わったが成果物を持たない)。既存の
+    // failIfIdleWithoutResult の扱いに従う。
+    if (scan.status === "unresolved" && (pending.observed || pending.failIfIdleWithoutResult)) {
       await this.finish(pending.sessionId);
     }
   }
@@ -967,16 +1065,17 @@ export class ManagedOpenCode implements OpenCodePort {
     if (!pending || pending.finishing) return;
     pending.finishing = true;
     try {
-      const message = await this.client.findAssistant(sessionId, pending.directory, pending.userMessageId);
-      if (!message || !isTerminalMessage(message.info)) {
-        if (!pending.failIfIdleWithoutResult) return;
-        throw new OpenCodeFailure(
-          "MISSING_TURN_RESULT",
-          `OpenCode session ${sessionId} became idle without an assistant result.`,
-          true,
-        );
+      const scan = await this.findTurnResult(sessionId, pending.userMessageId);
+      if (scan.status === "done") {
+        this.resolvePending(pending, scan.text);
+        return;
       }
-      this.resolvePending(pending, resultText(message));
+      if (!pending.failIfIdleWithoutResult) return;
+      throw new OpenCodeFailure(
+        "MISSING_TURN_RESULT",
+        `OpenCode session ${sessionId} became idle without an assistant result.`,
+        true,
+      );
     } catch (error) {
       this.rejectPending(pending, error);
     } finally {
@@ -1013,7 +1112,6 @@ export class ManagedOpenCode implements OpenCodePort {
     pending.lastActivityBySession.clear();
     pending.pollPrioritySessionIds.clear();
     pending.messageSnapshots.clear();
-    pending.observedMessageIds.clear();
     pending.stepKeys.clear();
   }
 
@@ -1024,34 +1122,27 @@ export class ManagedOpenCode implements OpenCodePort {
   }
 
   private async resolvePendingPrompts(): Promise<void> {
-    const directories = new Set<string>();
-    for (const pending of this.pending.values()) directories.add(pending.directory);
-    await Promise.all(
-      [...directories].map(async (directory) => {
-        const [permissions, questions] = await Promise.all([
-          this.client.pendingPermissions(directory),
-          this.client.pendingQuestions(directory),
-        ]);
-        const replies: Promise<void>[] = [];
-        for (const request of permissions) {
-          if (typeof request.id !== "string" || typeof request.sessionID !== "string") continue;
-          if (this.pending.get(request.sessionID)?.directory !== directory) continue;
-          replies.push(this.client.approvePermission(request.id, directory));
-        }
-        for (const request of questions) {
-          if (typeof request.id !== "string" || typeof request.sessionID !== "string") continue;
-          if (this.pending.get(request.sessionID)?.directory !== directory) continue;
-          replies.push(this.client.rejectQuestion(request.id, directory));
-        }
-        await Promise.allSettled(replies);
-      }),
-    );
+    let requests: PermissionRequest[] = [];
+    try {
+      requests = await this.client.pendingPermissions();
+    } catch {
+      return;
+    }
+    const replies: Promise<void>[] = [];
+    for (const request of requests) {
+      if (typeof request.id !== "string" || typeof request.sessionID !== "string") continue;
+      if (!this.pendingForSession(request.sessionID)) continue;
+      replies.push(this.client.approvePermission(request.id, request.sessionID));
+    }
+    await Promise.allSettled(replies);
   }
 }
 
-const JSON_HEADERS = { "content-type": "application/json" } as const;
+function sessionIdOf(payload: Record<string, unknown>): string | undefined {
+  return typeof payload.sessionID === "string" ? payload.sessionID : undefined;
+}
 
-function parseModel(model: string): { providerID: string; modelID: string } {
+function parseModel(model: string): { providerID: string; id: string } {
   const separator = model.indexOf("/");
   if (separator <= 0 || separator === model.length - 1) {
     throw new OpenCodeFailure(
@@ -1060,27 +1151,19 @@ function parseModel(model: string): { providerID: string; modelID: string } {
       false,
     );
   }
-  return { providerID: model.slice(0, separator), modelID: model.slice(separator + 1) };
+  return { providerID: model.slice(0, separator), id: model.slice(separator + 1) };
 }
 
-function resultText(message: MessageEnvelope): string {
-  if (message.info.error) throw errorFromAssistant(message.info.error);
+function resultText(entries: MessageEntry[]): string {
   let result = "";
-  for (const part of message.parts) {
-    if (part.type !== "text" || typeof part.text !== "string") continue;
-    result = result ? `${result}\n${part.text}` : part.text;
+  for (const entry of entries) {
+    for (const part of entry.content ?? []) {
+      const value = part as { type?: unknown; text?: unknown };
+      if (value.type !== "text" || typeof value.text !== "string") continue;
+      result = result ? `${result}\n${value.text}` : value.text;
+    }
   }
   return result;
-}
-
-function isTerminalMessage(info: {
-  error?: unknown;
-  finish?: unknown;
-  time?: { completed?: unknown };
-}): boolean {
-  if (info.error) return true;
-  if (info.finish === "tool-calls") return false;
-  return Boolean(info.finish || info.time?.completed);
 }
 
 function errorFromAssistant(error: unknown): OpenCodeFailure {
@@ -1105,13 +1188,15 @@ function errorFromAssistant(error: unknown): OpenCodeFailure {
 function isRelevantEvent(data: string): boolean {
   return (
     data.includes("session.created") ||
-    data.includes("permission.") ||
-    data.includes("question.") ||
-    data.includes("message.updated") ||
-    data.includes("message.part.updated") ||
-    data.includes("session.idle") ||
+    data.includes("session.inbox.") ||
+    data.includes("session.execution.") ||
+    data.includes("session.step.") ||
+    data.includes("session.text.") ||
+    data.includes("session.reasoning.") ||
+    data.includes("session.tool.") ||
     data.includes("session.status") ||
-    data.includes("session.error")
+    data.includes("session.error") ||
+    data.includes("permission.")
   );
 }
 
@@ -1137,88 +1222,28 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function jsonObject(response: Response, name: string): Promise<Record<string, unknown>> {
-  const value = await response.json();
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    invalidResponse(`OpenCode returned an invalid ${name} response.`);
-  }
-  return value as Record<string, unknown>;
-}
-
-function requestList(value: unknown, name: string): Array<{ id?: string; sessionID?: string }> {
-  if (!Array.isArray(value)) invalidResponse(`OpenCode returned an invalid ${name} list.`);
-  return value.map((entry) => {
-    if (!entry || typeof entry !== "object") invalidResponse(`OpenCode returned an invalid ${name} request.`);
-    const request = entry as { id?: unknown; sessionID?: unknown };
-    if (request.id !== undefined && typeof request.id !== "string") {
-      invalidResponse(`OpenCode returned an invalid ${name} request ID.`);
-    }
-    if (request.sessionID !== undefined && typeof request.sessionID !== "string") {
-      invalidResponse(`OpenCode returned an invalid ${name} session ID.`);
-    }
-    return {
-      id: typeof request.id === "string" ? request.id : undefined,
-      sessionID: typeof request.sessionID === "string" ? request.sessionID : undefined,
-    };
-  });
-}
-
-function messageList(value: unknown): MessageEnvelope[] {
+function messageList(value: unknown): MessageEntry[] {
   if (!Array.isArray(value)) invalidResponse("OpenCode returned an invalid message list.");
-  return value.map((entry) => {
-    if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid message.");
-    const message = entry as { info?: unknown; parts?: unknown };
-    if (!message.info || typeof message.info !== "object" || !Array.isArray(message.parts)) {
-      invalidResponse("OpenCode returned an invalid message envelope.");
-    }
-    const info = message.info as Record<string, unknown>;
-    if (typeof info.id !== "string" || (info.role !== "user" && info.role !== "assistant")) {
-      invalidResponse("OpenCode returned invalid message information.");
-    }
-    if (info.parentID !== undefined && typeof info.parentID !== "string") {
-      invalidResponse("OpenCode returned an invalid parent message ID.");
-    }
-    const parts = message.parts.map((part) => {
-      if (!part || typeof part !== "object") invalidResponse("OpenCode returned an invalid message part.");
-      const value = part as {
-        id?: unknown;
-        type?: unknown;
-        text?: unknown;
-        tool?: unknown;
-        time?: unknown;
-      };
-      if (value.id !== undefined && typeof value.id !== "string") {
-        invalidResponse("OpenCode returned an invalid message part ID.");
-      }
-      if (value.type !== undefined && typeof value.type !== "string") {
-        invalidResponse("OpenCode returned an invalid message part type.");
-      }
-      if (value.text !== undefined && typeof value.text !== "string") {
-        invalidResponse("OpenCode returned invalid message text.");
-      }
-      if (value.tool !== undefined && typeof value.tool !== "string") {
-        invalidResponse("OpenCode returned invalid message part tool.");
-      }
-      if (value.time !== undefined && (!value.time || typeof value.time !== "object")) {
-        invalidResponse("OpenCode returned an invalid message part time.");
-      }
-      return {
-        id: typeof value.id === "string" ? value.id : undefined,
-        type: typeof value.type === "string" ? value.type : undefined,
-        text: typeof value.text === "string" ? value.text : undefined,
-        tool: typeof value.tool === "string" ? value.tool : undefined,
-        time: value.time as MessagePart["time"],
-      };
-    });
-    return { info: info as unknown as MessageEnvelope["info"], parts };
-  });
+  return value.map((entry) => messageEntry(entry));
+}
+
+function messageEntry(value: unknown): MessageEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    invalidResponse("OpenCode returned an invalid message envelope.");
+  }
+  const entry = value as MessageEntry & Record<string, unknown>;
+  if (typeof entry.id !== "string") invalidResponse("OpenCode returned an invalid message ID.");
+  if (entry.time !== undefined && (!entry.time || typeof entry.time !== "object")) {
+    invalidResponse("OpenCode returned an invalid message time.");
+  }
+  return entry;
 }
 
 function sessionList(value: unknown): SessionInfo[] {
   if (!Array.isArray(value)) invalidResponse("OpenCode returned an invalid session list.");
   return value.map((entry) => {
     if (!entry || typeof entry !== "object") invalidResponse("OpenCode returned an invalid session.");
-    const session = entry as { id?: unknown; parentID?: unknown; time?: unknown };
+    const session = entry as SessionInfo & Record<string, unknown>;
     if (typeof session.id !== "string") invalidResponse("OpenCode returned an invalid session ID.");
     if (session.parentID !== undefined && typeof session.parentID !== "string") {
       invalidResponse("OpenCode returned an invalid parent session ID.");
@@ -1238,28 +1263,30 @@ function sessionList(value: unknown): SessionInfo[] {
   });
 }
 
-function snapshotMessages(messages: MessageEnvelope[]): MessageSnapshot {
-  const message = messages[messages.length - 1];
+function snapshotMessages(messages: MessageEntry[]): MessageSnapshot {
+  const message = messages.findLast((entry) => entry.type === "assistant");
   if (!message) return { fingerprint: "empty" };
   let tool: string | undefined;
-  const parts = message.parts.map((part) => {
-    if (typeof part.tool === "string" && part.tool) tool = part.tool;
-    return {
-      id: part.id,
-      type: part.type,
-      tool: part.tool,
-      time: part.time,
-    };
-  });
+  let text: string | undefined;
+  for (const part of message.content ?? []) {
+    const value = part as { type?: unknown; name?: unknown; text?: unknown };
+    if (typeof value.name === "string" && value.name) tool = value.name;
+    if (value.type === "text" && typeof value.text === "string") text = value.text;
+  }
   return {
     fingerprint: JSON.stringify({
-      id: message.info.id,
-      created: message.info.time?.created,
-      completed: message.info.time?.completed,
-      parts: parts.map((part) => ({ id: part.id, time: part.time })),
+      id: message.id,
+      created: message.time?.created,
+      streamed: message.time?.streamed,
+      completed: message.time?.completed,
+      outcome: message.outcome,
+      type: message.type,
+      tool,
+      text,
     }),
-    messageID: message.info.id,
-    ...(message.info.time?.created === undefined ? {} : { createdAt: message.info.time.created }),
+    messageID: message.id,
+    ...(message.time?.created === undefined ? {} : { createdAt: message.time.created }),
+    ...(message.type === undefined ? {} : { type: message.type }),
     ...(tool === undefined ? {} : { tool }),
   };
 }
