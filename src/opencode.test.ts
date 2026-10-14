@@ -829,10 +829,6 @@ test("completed turn mappings and late SSE stay out of the next turn", async () 
     },
   });
   const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 30, 2_000, 2, 2, 1_000);
-  const mappings = client as unknown as {
-    sessionTurns: Map<string, string>;
-    sessionParents: Map<string, string>;
-  };
   try {
     const session = await client.createSession({ directory: process.cwd() });
     await client.executeTurn(
@@ -843,8 +839,8 @@ test("completed turn mappings and late SSE stay out of the next turn", async () 
       new AbortController().signal,
       "turn-A",
     );
-    expect(mappings.sessionTurns.size).toBe(0);
-    expect(mappings.sessionParents.size).toBe(0);
+    // 完了した turn の対応付けは公開 API からも消えていること。
+    expect(await client.turnProgress("turn-A", session, process.cwd())).toBeUndefined();
 
     const second = client.executeTurn(
       session,
@@ -860,6 +856,9 @@ test("completed turn mappings and late SSE stay out of the next turn", async () 
     const before = await client.turnProgress("turn-B", session, process.cwd());
     if (!before) throw new Error("turn B progress was unavailable");
 
+    // 前 turn の子セッションについて、生成時刻が turn B 開始前の再送
+    // session.created と遅延した活動イベントを流しても turn B に混入しないこと。
+    openCode.emit("session.created", { sessionID: childId, parentID: session }, 1);
     openCode.emit("session.step.started", {
       sessionID: childId,
       started: Date.now(),
