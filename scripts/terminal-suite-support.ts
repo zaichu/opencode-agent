@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startFakeOpenCode } from "../test/fake-opencode.ts";
+import { initializeRepository } from "../test/git.ts";
 
 export interface TerminalFixture extends AsyncDisposable {
   cwd: string;
@@ -25,26 +26,6 @@ export async function createTerminalFixture(executable: string): Promise<Termina
       await removeTree(root);
     },
   });
-}
-
-async function initializeRepository(root: string): Promise<void> {
-  await git(root, "init", "-b", "main");
-  await git(root, "config", "user.email", "tests@opencode-agent.local");
-  await git(root, "config", "user.name", "opencode-agent tests");
-  await writeFile(join(root, "tracked.txt"), "main\n");
-  await git(root, "add", "tracked.txt");
-  await git(root, "commit", "-m", "initial");
-}
-
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`);
-  return stdout.trim();
 }
 
 export async function createLiveTerminalFixture(

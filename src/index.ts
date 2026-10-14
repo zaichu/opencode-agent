@@ -3,8 +3,7 @@
 import { runCli } from "./cli.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import { runDaemon } from "./daemon.ts";
-import type { ErrorBody } from "./protocol.ts";
-import { RuntimeError } from "./runtime.ts";
+import { publicErrorBody, type ErrorBody } from "./protocol.ts";
 
 const daemonMode = Bun.argv[2] === "__daemon";
 try {
@@ -32,20 +31,10 @@ try {
 }
 
 function errorBody(error: unknown): ErrorBody {
-  if (error instanceof RuntimeError) {
-    return {
-      code: error.code,
-      message: error.message,
-      ...(error.retryable ? { retryable: true as const } : {}),
-    };
-  }
   if (error instanceof ConfigError) {
     return { code: error.code, message: error.message };
   }
-  return {
-    code: "INTERNAL_ERROR",
-    message: error instanceof Error ? error.message : String(error),
-  };
+  return publicErrorBody(error);
 }
 
 function exitCode(code: string): number {

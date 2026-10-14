@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { git, initializeRepository } from "../test/git.ts";
 import { GitWorktrees, WorktreeError } from "./worktree.ts";
 
 const temporaryDirectories: string[] = [];
@@ -13,12 +14,7 @@ afterEach(async () => {
 test("a named worktree gets an isolated branch and can be rolled back", async () => {
   const project = await temporaryDirectory("opencode-agent-project-");
   const managed = await temporaryDirectory("opencode-agent-worktrees-");
-  await git(project, "init", "-b", "main");
-  await git(project, "config", "user.email", "tests@opencode-agent.local");
-  await git(project, "config", "user.name", "opencode-agent tests");
-  await writeFile(join(project, "tracked.txt"), "main\n");
-  await git(project, "add", "tracked.txt");
-  await git(project, "commit", "-m", "initial");
+  await initializeRepository(project);
 
   const worktrees = new GitWorktrees(managed);
   const created = await worktrees.create(project, "parser");
@@ -39,12 +35,7 @@ test("a named worktree gets an isolated branch and can be rolled back", async ()
 test("merge commits worker changes into a clean project checkout", async () => {
   const project = await temporaryDirectory("opencode-agent-merge-project-");
   const managed = await temporaryDirectory("opencode-agent-merge-worktrees-");
-  await git(project, "init", "-b", "main");
-  await git(project, "config", "user.email", "tests@opencode-agent.local");
-  await git(project, "config", "user.name", "opencode-agent tests");
-  await writeFile(join(project, "tracked.txt"), "main\n");
-  await git(project, "add", "tracked.txt");
-  await git(project, "commit", "-m", "initial");
+  await initializeRepository(project);
 
   const worktrees = new GitWorktrees(managed);
   const created = await worktrees.create(project, "parser");
@@ -62,12 +53,7 @@ test("merge commits worker changes into a clean project checkout", async () => {
 test("merge refuses to touch a dirty project checkout", async () => {
   const project = await temporaryDirectory("opencode-agent-dirty-project-");
   const managed = await temporaryDirectory("opencode-agent-dirty-worktrees-");
-  await git(project, "init", "-b", "main");
-  await git(project, "config", "user.email", "tests@opencode-agent.local");
-  await git(project, "config", "user.name", "opencode-agent tests");
-  await writeFile(join(project, "tracked.txt"), "main\n");
-  await git(project, "add", "tracked.txt");
-  await git(project, "commit", "-m", "initial");
+  await initializeRepository(project);
 
   const worktrees = new GitWorktrees(managed);
   const created = await worktrees.create(project, "parser");
@@ -90,15 +76,4 @@ async function temporaryDirectory(prefix: string): Promise<string> {
   const path = await mkdtemp(join(tmpdir(), prefix));
   temporaryDirectories.push(path);
   return path;
-}
-
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  if (exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr.trim()}`);
-  return stdout.trim();
 }

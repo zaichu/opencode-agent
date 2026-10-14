@@ -1,4 +1,4 @@
-import type { TurnId, WorkerId } from "./runtime.ts";
+import { RuntimeError, type TurnId, type WorkerId } from "./runtime.ts";
 
 type CommandFor<Worker extends string, Turn extends string> =
   | {
@@ -29,6 +29,22 @@ export class ProtocolError extends Error {
   constructor(readonly code: "INVALID_USAGE" | "INVALID_ID", message: string) {
     super(message);
   }
+}
+
+// RuntimeError の retryable は true のときだけ出力する(false は省略が契約)。
+// 入口固有の例外(ConfigError/ProtocolError)の識別は各入口が先に行う。
+export function publicErrorBody(error: unknown): ErrorBody {
+  if (error instanceof RuntimeError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.retryable ? { retryable: true as const } : {}),
+    };
+  }
+  return {
+    code: "INTERNAL_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+  };
 }
 
 export function decodeCommand(value: unknown): DecodedCommand {

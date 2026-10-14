@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { AdapterConfig } from "./config.ts";
 import { PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION } from "./config.ts";
 import { ManagedOpenCode } from "./opencode.ts";
-import { ProtocolError, decodeCommand, type DecodedCommand, type ErrorBody } from "./protocol.ts";
+import { ProtocolError, decodeCommand, publicErrorBody, type DecodedCommand, type ErrorBody } from "./protocol.ts";
 import {
   RuntimeError,
   createWorkerRuntime,
@@ -127,18 +127,8 @@ function json(value: unknown, status = 200): Response {
 
 
 function errorBody(error: unknown): ErrorBody {
-  if (error instanceof RuntimeError) {
-    return {
-      code: error.code,
-      message: error.message,
-      ...(error.retryable ? { retryable: true as const } : {}),
-    };
-  }
   if (error instanceof ProtocolError) return { code: error.code, message: error.message };
-  return {
-    code: "INTERNAL_ERROR",
-    message: error instanceof Error ? error.message : String(error),
-  };
+  return publicErrorBody(error);
 }
 
 function httpStatus(code: string): number {

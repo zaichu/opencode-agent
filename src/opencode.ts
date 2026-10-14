@@ -82,7 +82,6 @@ interface MessageSnapshot {
   fingerprint: string;
   messageID?: string;
   createdAt?: number;
-  type?: string;
   tool?: string;
 }
 
@@ -290,16 +289,7 @@ class OpenCodeClient {
     path: string,
     init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> } = {},
   ): Promise<Response> {
-    const response = await this.requestUrl(this.url(path), init);
-    if (response.status === 404) {
-      const detail = (await response.text()).trim().slice(0, 4096);
-      throw new OpenCodeFailure(
-        "OPENCODE_NOT_FOUND",
-        `OpenCode ${init.method ?? "GET"} ${path} failed (404)${detail ? `: ${detail}` : ""}`,
-        false,
-      );
-    }
-    return response;
+    return this.requestUrl(this.url(path), init);
   }
 
   private async body(response: Response): Promise<(Record<string, unknown> & { data?: unknown }) | undefined> {
@@ -389,7 +379,6 @@ export class ManagedOpenCode implements OpenCodePort {
   private readonly eventAbort = new AbortController();
   private readonly pending = new Map<string, PendingTurn>();
   private readonly pendingByTurn = new Map<string, PendingTurn>();
-  private readonly sessionParents = new Map<string, string>();
   private readonly sessionTurns = new Map<string, string>();
   private readonly appliedAgentBySession = new Map<string, string>();
   private readonly appliedModelBySession = new Map<string, string>();
@@ -547,20 +536,15 @@ export class ManagedOpenCode implements OpenCodePort {
       const fresh = snapshot.createdAt === undefined || snapshot.createdAt >= pending.startedAt;
       if (fresh && !pending.stepKeys.has(messageKey)) {
         // ステップとして数えるのは assistant メッセージだけ(user プロンプトや
-        // idle マーカーは SSE の step.started に対応しない)。
-        this.observeActivity(
-          pending,
-          sessionId,
-          Date.now(),
-          snapshot.type === "assistant" ? messageKey : undefined,
-          snapshot.tool,
-        );
+        // idle マーカーは SSE の step.started に対応しない)。snapshot は常に
+        // 最新の assistant メッセージを指す。
+        this.observeActivity(pending, sessionId, Date.now(), messageKey, snapshot.tool);
       }
       return;
     }
     if (previous.fingerprint === snapshot.fingerprint) return;
     const stepKey =
-      snapshot.type === "assistant" && previous.messageID !== snapshot.messageID
+      previous.messageID !== snapshot.messageID
         ? messageStepKey(sessionId, snapshot.messageID)
         : undefined;
     this.observeActivity(pending, sessionId, Date.now(), stepKey, snapshot.tool);
@@ -667,7 +651,6 @@ export class ManagedOpenCode implements OpenCodePort {
     }
     this.pending.clear();
     this.pendingByTurn.clear();
-    this.sessionParents.clear();
     this.sessionTurns.clear();
     this.appliedAgentBySession.clear();
     this.appliedModelBySession.clear();
@@ -924,12 +907,11 @@ export class ManagedOpenCode implements OpenCodePort {
     const sessionId = payload.sessionID;
     const parentID = typeof payload.parentID === "string" ? payload.parentID : undefined;
     const inheritedTurn = parentID ? this.sessionTurns.get(parentID) : undefined;
-    const turnId = inheritedTurn ?? this.pending.get(this.rootSession(sessionId))?.turnId;
+    const turnId = inheritedTurn ?? this.sessionTurns.get(sessionId);
     if (!turnId) return;
     const pending = this.pendingByTurn.get(turnId);
     if (!pending) return;
     if (isBeforeTurn(createdAt, pending.startedAt)) return;
-    if (parentID) this.sessionParents.set(sessionId, parentID);
     this.sessionTurns.set(sessionId, turnId);
     if (sessionId !== pending.sessionId) pending.descendantIds.add(sessionId);
     this.observeActivity(pending, sessionId, Date.now());
@@ -938,23 +920,7 @@ export class ManagedOpenCode implements OpenCodePort {
   private pendingForSession(sessionId: string | undefined): PendingTurn | undefined {
     if (typeof sessionId !== "string") return undefined;
     const turnId = this.sessionTurns.get(sessionId);
-    if (turnId) return this.pendingByTurn.get(turnId);
-    const rootId = this.rootSession(sessionId);
-    if (rootId === sessionId) return this.pending.get(rootId);
-    const pending = this.pending.get(rootId);
-    return pending?.descendantIds.has(sessionId) ? pending : undefined;
-  }
-
-  private rootSession(sessionId: string): string {
-    let current = sessionId;
-    const seen = new Set<string>();
-    while (!seen.has(current)) {
-      seen.add(current);
-      const parentID = this.sessionParents.get(current);
-      if (!parentID) break;
-      current = parentID;
-    }
-    return current;
+    return turnId === undefined ? undefined : this.pendingByTurn.get(turnId);
   }
 
   private adoptDescendant(pending: PendingTurn, sessionId: string): void {
@@ -1117,29 +1083,28 @@ export class ManagedOpenCode implements OpenCodePort {
   }
 
   private resolvePending(pending: PendingTurn, text: string): void {
-    if (this.pending.get(pending.sessionId) !== pending) return;
-    this.pending.delete(pending.sessionId);
-    this.pendingByTurn.delete(pending.turnId);
-    this.cleanupPendingMappings(pending);
-    pending.signal.removeEventListener("abort", pending.abortListener);
+    if (!this.releasePending(pending)) return;
     pending.resolve(text);
   }
 
   private rejectPending(pending: PendingTurn, error: unknown): void {
-    if (this.pending.get(pending.sessionId) !== pending) return;
+    if (!this.releasePending(pending)) return;
+    pending.reject(error);
+  }
+
+  private releasePending(pending: PendingTurn): boolean {
+    if (this.pending.get(pending.sessionId) !== pending) return false;
     this.pending.delete(pending.sessionId);
     this.pendingByTurn.delete(pending.turnId);
     this.cleanupPendingMappings(pending);
     pending.signal.removeEventListener("abort", pending.abortListener);
-    pending.reject(error);
+    return true;
   }
 
   private cleanupPendingMappings(pending: PendingTurn): void {
     for (const [sessionId, turnId] of this.sessionTurns) {
       if (turnId === pending.turnId) this.sessionTurns.delete(sessionId);
     }
-    this.sessionParents.delete(pending.sessionId);
-    for (const sessionId of pending.descendantIds) this.sessionParents.delete(sessionId);
     pending.descendantIds.clear();
     pending.activeSessions.clear();
     pending.lastActivityBySession.clear();
@@ -1319,7 +1284,6 @@ function snapshotMessages(messages: MessageEntry[]): MessageSnapshot {
     }),
     messageID: message.id,
     ...(message.time?.created === undefined ? {} : { createdAt: message.time.created }),
-    ...(message.type === undefined ? {} : { type: message.type }),
     ...(tool === undefined ? {} : { tool }),
   };
 }

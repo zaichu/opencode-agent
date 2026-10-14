@@ -12,31 +12,27 @@ import { daemonToken, resolveProject } from "./scope.ts";
 const DAEMON_PROBE_TIMEOUT_MS = 2_000;
 const DAEMON_STARTUP_PROBE_TIMEOUT_MS = 500;
 
-interface ParsedArgs {
-  options: Map<string, string>;
-  flags: Set<string>;
-  positionals: string[];
-}
+type ParsedArgs = ReturnType<typeof parseArgs>;
 
 export async function runCli(argv: string[], config: AdapterConfig): Promise<void> {
   const parsed = parseArgs(argv);
   const command = parsed.positionals.shift();
-  if (command === "version" || parsed.flags.has("version")) {
+  if (command === "version" || parsed.values.version) {
     console.log(VERSION);
     return;
   }
-  if (!command || parsed.flags.has("help")) {
+  if (!command || parsed.values.help) {
     console.log(help());
     return;
   }
 
   const projectRoot = await resolveProject({
-    project: parsed.options.get("project"),
+    project: parsed.values.project,
     cwd: process.cwd(),
   });
   const request = await makeRequest(command, parsed, projectRoot);
   const result = await callDaemon(request, config);
-  printResult(result, parsed.flags.has("text"));
+  printResult(result, parsed.values.text === true);
 }
 
 async function makeRequest(
@@ -48,25 +44,24 @@ async function makeRequest(
 
   switch (command) {
     case "spawn": {
-      const worktree = parsed.options.get("worktree");
       return {
         operation: "spawn",
         input: {
           task: await readPrompt(parsed),
           projectRoot,
-          worktree,
-          label: parsed.options.get("label"),
-          agent: parsed.options.get("agent"),
-          model: parsed.options.get("model"),
+          worktree: parsed.values.worktree,
+          label: parsed.values.label,
+          agent: parsed.values.agent,
+          model: parsed.values.model,
         },
       };
     }
     case "list":
       requirePositionals(parsed, 0, "list");
-      if (parsed.flags.has("all") && parsed.options.has("project")) {
+      if (parsed.values.all && parsed.values.project !== undefined) {
         throw usage("--all and --project cannot be used together.");
       }
-      return { operation: "list", input: { projectRoot: parsed.flags.has("all") ? undefined : projectRoot } };
+      return { operation: "list", input: { projectRoot: parsed.values.all ? undefined : projectRoot } };
     case "status":
       return { operation: "status", input: { id: oneId(parsed, "status") } };
     case "followup": {
@@ -77,8 +72,8 @@ async function makeRequest(
         input: {
           workerId,
           message: await readPrompt(parsed),
-          agent: parsed.options.get("agent"),
-          model: parsed.options.get("model"),
+          agent: parsed.values.agent,
+          model: parsed.values.model,
         },
       };
     }
@@ -100,7 +95,7 @@ async function callDaemon(command: CommandRequest, config: AdapterConfig): Promi
   // 先に /health で疎通を確かめてから本コマンドを送る。
   // コマンドを投機的に送って失敗時に再送する形にすると、送信が実際には届いていた場合に
   // 同じ spawn が二重実行されうる。/health は冪等なので安全に短い timeout を掛けられる。
-  if (!(await daemonHealthy(config))) {
+  if (!(await probeDaemon(config, DAEMON_PROBE_TIMEOUT_MS))) {
     await startDaemon(config);
   }
   const response = await daemonFetch(command, token, config);
@@ -121,11 +116,12 @@ async function callDaemon(command: CommandRequest, config: AdapterConfig): Promi
 // daemon が起きているかの確認。listen していないポートへの接続が RST を返さず
 // ハングする環境(WSL2 の networkingMode=mirrored など)があるため、必ず timeout を掛ける。
 // timeout が無いと fetch が例外を投げず、daemon 起動フローへ進めないまま固まる。
-async function daemonHealthy(config: AdapterConfig): Promise<boolean> {
+// 通信失敗だけを「不在」とし、プロトコル不一致や JSON 破損は呼び出し側へ伝える。
+async function probeDaemon(config: AdapterConfig, timeoutMs: number): Promise<boolean> {
   let response: Response;
   try {
     response = await fetch(`${config.daemonUrl}/health`, {
-      signal: AbortSignal.timeout(DAEMON_PROBE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
     return false;
@@ -164,22 +160,7 @@ async function startDaemon(config: AdapterConfig): Promise<void> {
 
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      // 起動待ちの間はまだ listen していないため、timeout 無しだとハングする環境がある。
-      const response = await fetch(`${config.daemonUrl}/health`, {
-        signal: AbortSignal.timeout(DAEMON_STARTUP_PROBE_TIMEOUT_MS),
-      });
-      assertProtocol(response);
-      const health = (await response.json()) as {
-        name?: unknown;
-        protocol?: unknown;
-      };
-      if (
-        response.ok &&
-        health.name === "opencode-agent" &&
-        health.protocol === PROTOCOL_VERSION
-      ) {
-        return;
-      }
+      if (await probeDaemon(config, DAEMON_STARTUP_PROBE_TIMEOUT_MS)) return;
     } catch (error) {
       if (error instanceof RuntimeError && error.code === "DAEMON_VERSION_MISMATCH") throw error;
     }
@@ -202,9 +183,9 @@ function assertProtocol(response: Response): void {
   }
 }
 
-function parseArgs(argv: string[]): ParsedArgs {
+function parseArgs(argv: string[]) {
   try {
-    const parsed = parseNodeArgs({
+    return parseNodeArgs({
       args: argv,
       allowPositionals: true,
       strict: true,
@@ -215,13 +196,6 @@ function parseArgs(argv: string[]): ParsedArgs {
         help: { type: "boolean" }, version: { type: "boolean" },
       },
     });
-    const options = new Map<string, string>();
-    const flags = new Set<string>();
-    for (const [name, value] of Object.entries(parsed.values)) {
-      if (typeof value === "string") options.set(name, value);
-      else if (value === true) flags.add(name);
-    }
-    return { options, flags, positionals: parsed.positionals };
   } catch (error) {
     throw usage(error instanceof Error ? error.message : String(error));
   }
@@ -240,20 +214,22 @@ function rejectUnusedOptions(parsed: ParsedArgs, command: string): void {
   };
   const commandOptions = allowed[command];
   if (!commandOptions) return;
-  for (const option of parsed.options.keys()) {
-    if (!commandOptions.has(option)) throw usage(`--${option} cannot be used with ${command}.`);
+  for (const [name, value] of Object.entries(parsed.values)) {
+    if (typeof value === "string" && !commandOptions.has(name)) {
+      throw usage(`--${name} cannot be used with ${command}.`);
+    }
   }
-  if (parsed.flags.has("stdin") && command !== "spawn" && command !== "followup") {
+  if (parsed.values.stdin && command !== "spawn" && command !== "followup") {
     throw usage(`--stdin cannot be used with ${command}.`);
   }
-  if (parsed.flags.has("all") && command !== "list") {
+  if (parsed.values.all && command !== "list") {
     throw usage(`--all cannot be used with ${command}.`);
   }
 }
 
 async function readPrompt(parsed: ParsedArgs): Promise<string> {
-  const fromFile = parsed.options.get("file");
-  const fromStdin = parsed.flags.has("stdin");
+  const fromFile = parsed.values.file;
+  const fromStdin = parsed.values.stdin === true;
   const fromArgs = parsed.positionals.length > 0;
   const sources = Number(Boolean(fromFile)) + Number(fromStdin) + Number(fromArgs);
   if (sources !== 1) throw usage("Supply exactly one prompt: arguments, --file, or --stdin.");
