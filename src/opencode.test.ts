@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { startFakeOpenCode, type FakeMessage, type FakeOpenCode, type FakeSession, type PromptContext } from "../test/fake-opencode.ts";
 import { ManagedOpenCode } from "./opencode.ts";
 
@@ -957,6 +960,87 @@ test("progress events (busy) postpone the timeout", async () => {
     openCode.stop();
   }
 });
+
+test("a persisted serve password reconnects to the server that used it", async () => {
+  // daemon が落ちて serve だけが残った想定。状態ディレクトリに退避した
+  // パスワードを次の起動で読み、401 の serve へそのまま接続できる。
+  await withoutEnvPassword(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-agent-auth-"));
+    const passwordFile = join(directory, "serve.password");
+    await writeFile(passwordFile, "pw-persisted", { mode: 0o600 });
+    const openCode = startFakeOpenCode({ password: "pw-persisted" });
+    const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10, 2_000, 2, 2, 1_000, passwordFile);
+    try {
+      const session = await client.createSession({ directory: process.cwd() });
+      const result = await client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_77777777777777777777777777777777",
+        { message: "auth check" },
+        new AbortController().signal,
+      );
+      expect(result).toBe("reply: auth check");
+    } finally {
+      await client.stop();
+      openCode.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a password from OPENCODE_PASSWORD authenticates against the server", async () => {
+  await withoutEnvPassword(async () => {
+    Bun.env.OPENCODE_PASSWORD = "pw-env";
+    const openCode = startFakeOpenCode({ password: "pw-env" });
+    const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10, 2_000, 2, 2, 1_000);
+    try {
+      const session = await client.createSession({ directory: process.cwd() });
+      const result = await client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_88888888888888888888888888888888",
+        { message: "env auth" },
+        new AbortController().signal,
+      );
+      expect(result).toBe("reply: env auth");
+    } finally {
+      await client.stop();
+      openCode.stop();
+    }
+  });
+});
+
+test("a server that rejects credentials reports OPENCODE_UNAUTHORIZED", async () => {
+  await withoutEnvPassword(async () => {
+    const openCode = startFakeOpenCode({ password: "pw-secret" });
+    const client = new ManagedOpenCode(openCode.url);
+    try {
+      // 401 は稼働扱いなので serve の起動は試みず、リクエストの 401 が
+      // OPENCODE_UNAUTHORIZED として返る。
+      await expect(client.createSession({ directory: process.cwd() })).rejects.toMatchObject({
+        code: "OPENCODE_UNAUTHORIZED",
+      });
+    } finally {
+      await client.stop();
+      openCode.stop();
+    }
+  });
+});
+
+async function withoutEnvPassword<T>(run: () => Promise<T>): Promise<T> {
+  const password = Bun.env.OPENCODE_PASSWORD;
+  const serverPassword = Bun.env.OPENCODE_SERVER_PASSWORD;
+  delete Bun.env.OPENCODE_PASSWORD;
+  delete Bun.env.OPENCODE_SERVER_PASSWORD;
+  try {
+    return await run();
+  } finally {
+    if (password === undefined) delete Bun.env.OPENCODE_PASSWORD;
+    else Bun.env.OPENCODE_PASSWORD = password;
+    if (serverPassword === undefined) delete Bun.env.OPENCODE_SERVER_PASSWORD;
+    else Bun.env.OPENCODE_SERVER_PASSWORD = serverPassword;
+  }
+}
 
 function addPolledMessage(session: FakeSession, index: number, tool: string): void {
   session.messages.push({

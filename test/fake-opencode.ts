@@ -37,6 +37,9 @@ export interface PromptContext {
 export interface FakeOpenCodeScenario {
   onPrompt?(context: PromptContext): void | Promise<void>;
   onPermissionReply?(requestId: string): void | Promise<void>;
+  // 指定すると全 /api ルートが `Basic opencode:<password>` を要求し、
+  // 不一致は実 API と同じ 401 を返す。
+  password?: string;
   activeResponse?(sessions: ReadonlyMap<string, FakeSession>): unknown;
   // messagesResponse / pollMessagesResponse の配列は実 API と同じ降順(desc)で
   // 返すこと。session.messages は昇順で保持しているため、そのまま渡すと逆順になる。
@@ -79,6 +82,12 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     port: 0,
     async fetch(request) {
       const url = new URL(request.url);
+      if (scenario.password !== undefined) {
+        const expected = `Basic ${btoa(`opencode:${scenario.password}`)}`;
+        if (request.headers.get("authorization") !== expected) {
+          return Response.json({ error: { message: "unauthorized" } }, { status: 401 });
+        }
+      }
       if (request.method === "GET" && url.pathname === "/api/info") {
         return Response.json({ version: "test" });
       }

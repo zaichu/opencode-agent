@@ -1,3 +1,5 @@
+import { readFile, writeFile } from "node:fs/promises";
+
 export interface TurnProgress {
   steps: number;
   activeSubagents: number;
@@ -388,7 +390,7 @@ export class ManagedOpenCode implements OpenCodePort {
   private reconnecting?: Promise<void>;
   private stopped = false;
   private readonly timeoutTimer: ReturnType<typeof setInterval>;
-  private readonly password: string | undefined;
+  private password: string | undefined;
 
   constructor(
     private readonly baseUrl = "http://127.0.0.1:4096",
@@ -399,6 +401,7 @@ export class ManagedOpenCode implements OpenCodePort {
     private readonly pollDescendantLimit = DEFAULT_POLL_DESCENDANT_LIMIT,
     private readonly pollMessageLimit = DEFAULT_POLL_MESSAGE_LIMIT,
     private readonly activeSessionTtlMs = DEFAULT_ACTIVE_SESSION_TTL_MS,
+    private readonly passwordFile?: string,
   ) {
     // 外部接続のときは環境変数のパスワード、自分で起動するときは固定パスワードを
     // 生成する。乱数パスワードは子プロセスに OPENCODE_PASSWORD として渡されるため
@@ -678,7 +681,24 @@ export class ManagedOpenCode implements OpenCodePort {
     return this.starting;
   }
 
+  // 自分が起動した serve のパスワードは passwordFile(= daemon の状態ディレクトリ
+  // 配下)に退避する。daemon が SIGKILL 等で落ちて serve だけが残った場合、次の
+  // daemon が同じパスワードで 401 の孤児 serve に接続して復帰できる。
+  private async loadPersistedPassword(): Promise<void> {
+    if (this.password !== undefined || !this.passwordFile) return;
+    try {
+      const value = (await readFile(this.passwordFile, "utf8")).trim();
+      if (value) {
+        this.password = value;
+        this.auth.set(value);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
   private async startServer(): Promise<void> {
+    await this.loadPersistedPassword();
     if (await this.client.health()) return;
 
     const url = new URL(this.baseUrl);
@@ -692,6 +712,9 @@ export class ManagedOpenCode implements OpenCodePort {
 
     const port = url.port || "80";
     const password = this.password ?? randomPassword();
+    if (this.password === undefined && this.passwordFile) {
+      await writeFile(this.passwordFile, password, { mode: 0o600 });
+    }
     this.auth.set(password);
     this.child = Bun.spawn({
       cmd: [this.executable, "serve", "--hostname", url.hostname, "--port", port],
