@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { startFakeOpenCode, type FakeMessage, type FakeOpenCode, type FakeSession, type PromptContext } from "../test/fake-opencode.ts";
 import { ManagedOpenCode } from "./opencode.ts";
 
@@ -8,7 +11,7 @@ test("permission asks are auto-approved only for an active adapter worker", asyn
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       prompt = context;
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       assistant = context.addAssistant({ text: "permission approved" });
       context.emit("permission.asked", { id: "unrelated-permission", sessionID: "some-other-session" });
@@ -36,19 +39,21 @@ test("permission asks are auto-approved only for an active adapter worker", asyn
   }
 });
 
-test("a completed OpenCode message is recovered by its durable user message ID", async () => {
+test("a completed OpenCode turn is recovered from its durable user message ID", async () => {
   const messageId = "msg_11111111111111111111111111111111";
   const openCode = startFakeOpenCode();
-  openCode.session("session-recovery").messages.push({
-    info: {
+  const session = openCode.session("session-recovery");
+  session.messages.push(
+    { id: messageId, type: "user", time: { created: 1 }, text: "recover the durable task" },
+    {
       id: "assistant-recovered",
-      role: "assistant",
-      parentID: messageId,
-      time: { created: 1, completed: 2 },
+      type: "assistant",
+      time: { created: 2, completed: 3 },
+      content: [{ type: "text", text: "recovered result" }],
       finish: "stop",
     },
-    parts: [{ type: "text", text: "recovered result" }],
-  });
+    { id: "idle-recovered", type: "idle", time: { created: 4 }, outcome: "succeeded" },
+  );
   const client = new ManagedOpenCode(openCode.url);
   try {
     expect(
@@ -60,18 +65,20 @@ test("a completed OpenCode message is recovered by its durable user message ID",
         new AbortController().signal,
       ),
     ).toBe("recovered result");
+    expect(openCode.submissions).toBe(0);
   } finally {
     await client.stop();
     openCode.stop();
   }
 });
 
-test("recovery resubmits a turn that OpenCode never persisted", async () => {
+test("recovery resubmits a turn OpenCode never persisted", async () => {
   const messageId = "msg_55555555555555555555555555";
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       context.addUser();
       context.addAssistant({ text: "recovered after resubmit", completed: true, finish: "stop" });
+      context.complete(context.session.messages[context.session.messages.length - 1]!);
     },
   });
   openCode.session("session-lost-prompt");
@@ -93,10 +100,10 @@ test("recovery resubmits a turn that OpenCode never persisted", async () => {
   }
 });
 
-test("a completed message event finishes without relying on session idle", async () => {
+test("a succeeded execution event finishes without polling differences", async () => {
   const openCode = startFakeOpenCode({
     onPrompt(context) {
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       void (async () => {
         await Bun.sleep(10);
@@ -106,7 +113,7 @@ test("a completed message event finishes without relying on session idle", async
           completed: true,
           finish: "stop",
         });
-        context.emitMessage(assistant);
+        context.complete(assistant);
       })();
     },
   });
@@ -128,7 +135,7 @@ test("a completed message event finishes without relying on session idle", async
   }
 });
 
-test("an idle status immediately after prompt acceptance does not fail the turn", async () => {
+test("an execution event immediately after prompt admission does not fail the turn", async () => {
   const openCode = startFakeOpenCode({
     async onPrompt(context) {
       context.addUser();
@@ -141,8 +148,7 @@ test("an idle status immediately after prompt acceptance does not fail the turn"
           completed: true,
           finish: "stop",
         });
-        context.emitMessage(assistant);
-        context.emit("session.idle", { sessionID: context.session.id });
+        context.complete(assistant);
       })();
     },
   });
@@ -153,8 +159,8 @@ test("an idle status immediately after prompt acceptance does not fail the turn"
       await client.executeTurn(
         session,
         process.cwd(),
-        "msg_33333333333333333333333333",
-        { message: "complete after async acceptance" },
+        "msg_33333333333333333333333333333333",
+        { message: "complete after async admission" },
         new AbortController().signal,
       ),
     ).toBe("accepted result");
@@ -167,15 +173,14 @@ test("an idle status immediately after prompt acceptance does not fail the turn"
 test("an intermediate tool-call step does not replace the final assistant report", async () => {
   const openCode = startFakeOpenCode({
     async onPrompt(context) {
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
-      const toolCall = context.addAssistant({
+      context.addAssistant({
         id: "assistant-tool-call",
-        parts: [{ type: "tool", tool: "task", state: { status: "completed" } }],
+        content: [{ type: "tool", name: "task" }],
         completed: true,
         finish: "tool-calls",
       });
-      context.emitMessage(toolCall);
       await Bun.sleep(10);
       void (async () => {
         await Bun.sleep(20);
@@ -185,8 +190,7 @@ test("an intermediate tool-call step does not replace the final assistant report
           completed: true,
           finish: "stop",
         });
-        context.emitMessage(final);
-        context.emit("session.idle", { sessionID: context.session.id });
+        context.complete(final);
       })();
     },
   });
@@ -197,7 +201,7 @@ test("an intermediate tool-call step does not replace the final assistant report
       await client.executeTurn(
         session,
         process.cwd(),
-        "msg_44444444444444444444444444",
+        "msg_44444444444444444444444444444444",
         { message: "delegate to a subagent" },
         new AbortController().signal,
       ),
@@ -217,7 +221,7 @@ test("malformed OpenCode responses fail at the adapter seam", async () => {
       client.executeTurn(
         "session-malformed",
         process.cwd(),
-        "msg_66666666666666666666666666",
+        "msg_66666666666666666666666666666666",
         { message: "fail predictably" },
         new AbortController().signal,
       ),
@@ -260,7 +264,7 @@ test("child-only SSE activity postpones the timeout", async () => {
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       parentId = context.session.id;
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       void (async () => {
         for (let i = 0; i < 6; i++) {
@@ -296,7 +300,7 @@ test("events from a completed turn do not mark the next turn", async () => {
   let secondContext: PromptContext | undefined;
   const openCode = startFakeOpenCode({
     onPrompt(context) {
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       if (context.prompt === "first turn") {
         const oldChild = openCode.session("old-child", process.cwd(), context.session.id);
@@ -331,12 +335,12 @@ test("events from a completed turn do not mark the next turn", async () => {
       "turn-two",
     );
     await Bun.sleep(30);
-    openCode.emit("session.status", { sessionID: "old-child", status: { type: "busy" } });
-    openCode.emit("message.part.updated", {
+    openCode.emit("session.step.started", {
       sessionID: "old-child",
-      time: Date.now(),
-      part: { id: "old-late", messageID: "old-late-message", sessionID: "old-child", type: "tool", tool: "old-tool" },
+      started: Date.now(),
+      assistantMessageID: "old-late-message",
     });
+    openCode.emit("session.tool.input.started", { sessionID: "old-child", name: "old-tool" });
     await Bun.sleep(10);
     const progress = await client.turnProgress("turn-two", session, process.cwd());
     expect(progress?.activeSubagents).toBe(0);
@@ -356,7 +360,7 @@ test("grandchild SSE activity is included in progress", async () => {
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       parentId = context.session.id;
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       const child = openCode.session("child-progress-parent", process.cwd(), parentId);
       const grandchild = openCode.session("grandchild-progress", process.cwd(), child.id);
@@ -391,7 +395,7 @@ test("stalled child SSE activity still times out", async () => {
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       parentId = context.session.id;
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       const child = openCode.session("child-stalled", process.cwd(), parentId);
       emitStep(openCode, child, 1, "read");
@@ -449,7 +453,7 @@ test("failed or empty polling responses do not count as progress", async () => {
     pollMessagesStatus: () => (mode === "failed" ? 500 : 200),
     pollMessagesResponse: (session) => (mode === "empty" ? [] : session?.messages ?? []),
     onPrompt(context) {
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       mode = "failed";
     },
@@ -481,12 +485,12 @@ test("failed or empty polling responses do not count as progress", async () => {
 });
 
 test("polling catches child activity missed by SSE", async () => {
-  let openCode!: FakeOpenCode;
-  openCode = startFakeOpenCode({
+  let child!: FakeSession;
+  const openCode = startFakeOpenCode({
     onPrompt(context) {
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
-      const child = openCode.session("polled-child", process.cwd(), context.session.id, false);
+      child = openCode.session("polled-child", process.cwd(), context.session.id, false);
       void (async () => {
         for (let index = 0; index < 6; index++) {
           await Bun.sleep(25);
@@ -533,7 +537,7 @@ test("polling caps descendant discovery and message requests per round", async (
   openCode = startFakeOpenCode({
     onPrompt(context) {
       rootId = context.session.id;
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       for (let index = 0; index < 6; index++) {
         const child = openCode.session(`capped-child-${index}`, process.cwd(), rootId, false);
@@ -591,7 +595,7 @@ test("recently active descendants are polled before older descendants", async ()
   openCode = startFakeOpenCode({
     onPrompt(context) {
       rootId = context.session.id;
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       for (let index = 0; index < 5; index++) {
         openCode.session(`older-child-${index}`, process.cwd(), rootId, false);
@@ -599,17 +603,13 @@ test("recently active descendants are polled before older descendants", async ()
       const target = openCode.session("recent-child", process.cwd(), rootId, false);
       targetId = target.id;
       openCode.emit("session.created", {
-        info: { id: target.id, parentID: rootId, time: { created: Date.now() } },
-      });
-      openCode.emit("message.part.updated", {
         sessionID: target.id,
-        time: Date.now(),
-        part: {
-          id: "recent-part",
-          messageID: "recent-message",
-          sessionID: target.id,
-          type: "step-start",
-        },
+        parentID: rootId,
+      });
+      openCode.emit("session.step.started", {
+        sessionID: target.id,
+        started: Date.now(),
+        assistantMessageID: "recent-message",
       });
     },
     pollMessagesResponse(session) {
@@ -651,7 +651,7 @@ test("the same message is counted once when polling and SSE overlap", async () =
   openCode = startFakeOpenCode({
     onPrompt(current) {
       context = current;
-      current.session.status = "busy";
+      current.session.busy = true;
       current.addUser();
       child = openCode.session("overlap-child", process.cwd(), current.session.id, false);
       addPolledMessage(child, 1, "bash");
@@ -675,15 +675,10 @@ test("the same message is counted once when polling and SSE overlap", async () =
   try {
     await firstPolled;
     await Bun.sleep(10);
-    openCode.emit("message.part.updated", {
+    openCode.emit("session.step.started", {
       sessionID: child.id,
-      time: Date.now(),
-      part: {
-        id: "overlap-start",
-        messageID: child.messages[0]!.info.id,
-        sessionID: child.id,
-        type: "step-start",
-      },
+      started: Date.now(),
+      assistantMessageID: child.messages[child.messages.length - 1]!.id,
     });
     await Bun.sleep(20);
     const progress = await client.turnProgress("turn-deduplicate-steps", session, process.cwd());
@@ -704,7 +699,7 @@ test("completed turn descendants do not attach to a follow-up turn", async () =>
   openCode = startFakeOpenCode({
     onPrompt(context) {
       sessionId = context.session.id;
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       if (context.prompt === "first turn") {
         openCode.session("retired-child", process.cwd(), sessionId);
@@ -739,9 +734,7 @@ test("completed turn descendants do not attach to a follow-up turn", async () =>
     );
     second.catch(() => {});
     await Bun.sleep(20);
-    openCode.emit("session.created", {
-      info: { id: "retired-child", parentID: sessionId, time: { created: 1 } },
-    });
+    openCode.emit("session.created", { sessionID: "retired-child", parentID: sessionId }, 1);
     await Bun.sleep(20);
     const progress = await client.turnProgress("turn-second", session, process.cwd());
     expect(progress?.activeSubagents).toBe(0);
@@ -761,7 +754,7 @@ test("completed turn mappings and late SSE stay out of the next turn", async () 
   let childId = "late-child";
   openCode = startFakeOpenCode({
     async onPrompt(context) {
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       if (context.prompt === "turn A") {
         openCode.session(childId, process.cwd(), context.session.id);
@@ -805,15 +798,10 @@ test("completed turn mappings and late SSE stay out of the next turn", async () 
     const before = await client.turnProgress("turn-B", session, process.cwd());
     if (!before) throw new Error("turn B progress was unavailable");
 
-    openCode.emit("message.part.updated", {
+    openCode.emit("session.step.started", {
       sessionID: childId,
-      time: Date.now(),
-      part: {
-        id: "late-part",
-        messageID: "late-message",
-        sessionID: childId,
-        type: "step-start",
-      },
+      started: Date.now(),
+      assistantMessageID: "late-message",
     });
     openCode.emit("session.status", { sessionID: childId, status: { type: "busy" } });
     await Bun.sleep(20);
@@ -838,7 +826,7 @@ test("inactive descendants leave activeSubagents after the idle grace period", a
   let openCode!: FakeOpenCode;
   openCode = startFakeOpenCode({
     onPrompt(context) {
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       const child = openCode.session("stale-child", process.cwd(), context.session.id);
       emitStep(openCode, child, 1, "bash");
@@ -870,7 +858,7 @@ test("polling finds descendants beyond the first hundred sessions", async () => 
   let openCode!: FakeOpenCode;
   openCode = startFakeOpenCode({
     onPrompt(context) {
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       const children: FakeSession[] = [];
       for (let index = 0; index <= 100; index++) {
@@ -910,7 +898,7 @@ test("turn progress summarizes subagent activity", async () => {
   const openCode = startFakeOpenCode({
     onPrompt(context) {
       parentId = context.session.id;
-      context.session.status = "idle";
+      context.session.busy = false;
       context.addUser();
       const child = openCode.session("child-progress", process.cwd(), parentId);
       emitStep(openCode, child, 1, "bash");
@@ -946,7 +934,7 @@ test("progress events (busy) postpone the timeout", async () => {
   // タイムアウトせず、最後に完了すれば正常に resolve することを検証する。
   const openCode = startFakeOpenCode({
     async onPrompt(context) {
-      context.session.status = "busy";
+      context.session.busy = true;
       context.addUser();
       for (let i = 0; i < 5; i++) {
         await Bun.sleep(20);
@@ -973,31 +961,105 @@ test("progress events (busy) postpone the timeout", async () => {
   }
 });
 
+test("a persisted serve password reconnects to the server that used it", async () => {
+  // daemon が落ちて serve だけが残った想定。状態ディレクトリに退避した
+  // パスワードを次の起動で読み、401 の serve へそのまま接続できる。
+  await withoutEnvPassword(async () => {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-agent-auth-"));
+    const passwordFile = join(directory, "serve.password");
+    await writeFile(passwordFile, "pw-persisted", { mode: 0o600 });
+    const openCode = startFakeOpenCode({ password: "pw-persisted" });
+    const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10, 2_000, 2, 2, 1_000, passwordFile);
+    try {
+      const session = await client.createSession({ directory: process.cwd() });
+      const result = await client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_77777777777777777777777777777777",
+        { message: "auth check" },
+        new AbortController().signal,
+      );
+      expect(result).toBe("reply: auth check");
+    } finally {
+      await client.stop();
+      openCode.stop();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+test("a password from OPENCODE_PASSWORD authenticates against the server", async () => {
+  await withoutEnvPassword(async () => {
+    Bun.env.OPENCODE_PASSWORD = "pw-env";
+    const openCode = startFakeOpenCode({ password: "pw-env" });
+    const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10, 2_000, 2, 2, 1_000);
+    try {
+      const session = await client.createSession({ directory: process.cwd() });
+      const result = await client.executeTurn(
+        session,
+        process.cwd(),
+        "msg_88888888888888888888888888888888",
+        { message: "env auth" },
+        new AbortController().signal,
+      );
+      expect(result).toBe("reply: env auth");
+    } finally {
+      await client.stop();
+      openCode.stop();
+    }
+  });
+});
+
+test("a server that rejects credentials reports OPENCODE_UNAUTHORIZED", async () => {
+  await withoutEnvPassword(async () => {
+    const openCode = startFakeOpenCode({ password: "pw-secret" });
+    const client = new ManagedOpenCode(openCode.url);
+    try {
+      // 401 は稼働扱いなので serve の起動は試みず、リクエストの 401 が
+      // OPENCODE_UNAUTHORIZED として返る。
+      await expect(client.createSession({ directory: process.cwd() })).rejects.toMatchObject({
+        code: "OPENCODE_UNAUTHORIZED",
+      });
+    } finally {
+      await client.stop();
+      openCode.stop();
+    }
+  });
+});
+
+async function withoutEnvPassword<T>(run: () => Promise<T>): Promise<T> {
+  const password = Bun.env.OPENCODE_PASSWORD;
+  const serverPassword = Bun.env.OPENCODE_SERVER_PASSWORD;
+  delete Bun.env.OPENCODE_PASSWORD;
+  delete Bun.env.OPENCODE_SERVER_PASSWORD;
+  try {
+    return await run();
+  } finally {
+    if (password === undefined) delete Bun.env.OPENCODE_PASSWORD;
+    else Bun.env.OPENCODE_PASSWORD = password;
+    if (serverPassword === undefined) delete Bun.env.OPENCODE_SERVER_PASSWORD;
+    else Bun.env.OPENCODE_SERVER_PASSWORD = serverPassword;
+  }
+}
+
 function addPolledMessage(session: FakeSession, index: number, tool: string): void {
   session.messages.push({
-    info: {
-      id: `${session.id}-polled-message-${index}`,
-      sessionID: session.id,
-      role: "assistant",
-      time: { created: Date.now() },
-    },
-    parts: [{ id: `${session.id}-polled-part-${index}`, type: "tool", tool }],
+    id: `${session.id}-polled-message-${index}`,
+    type: "assistant",
+    time: { created: Date.now() },
+    content: [{ type: "tool", name: tool }],
   });
 }
 
 function emitStep(openCode: FakeOpenCode, session: FakeSession, step: number, tool?: string): void {
   const messageID = `${session.id}-message-${step}`;
   openCode.emit("session.status", { sessionID: session.id, status: { type: "busy" } });
-  openCode.emit("message.part.updated", {
+  openCode.emit("session.step.started", {
     sessionID: session.id,
-    time: Date.now(),
-    part: { id: `${messageID}-start`, messageID, sessionID: session.id, type: "step-start" },
+    started: Date.now(),
+    assistantMessageID: messageID,
   });
   if (tool) {
-    openCode.emit("message.part.updated", {
-      sessionID: session.id,
-      time: Date.now(),
-      part: { id: `${messageID}-tool`, messageID, sessionID: session.id, type: "tool", tool },
-    });
+    openCode.emit("session.tool.input.started", { sessionID: session.id, name: tool });
   }
 }
