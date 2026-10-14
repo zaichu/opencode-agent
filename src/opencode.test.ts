@@ -1072,6 +1072,89 @@ test("a password from OPENCODE_PASSWORD authenticates against the server", async
   });
 });
 
+test("polling picks up a tool change on an already seen message", async () => {
+  // Issue #3 の fingerprint 残件が再発しないことの固定。snapshot の fingerprint が
+  // tool/type/text を含むため、id・時刻が変わらないメッセージの tool 書き換えも
+  // lastTool の更新として拾える。
+  const message: FakeMessage = {
+    id: "tool-rewritten",
+    type: "assistant",
+    time: { created: 0 },
+    content: [{ type: "tool", name: "read" }],
+  };
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.busy = true;
+      context.addUser();
+      message.time.created = Date.now();
+      context.session.messages.push(message);
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    const pending = client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_55555555555555555555555555555555",
+      { message: "rewrite a polled tool" },
+      new AbortController().signal,
+      "turn-tool-rewrite",
+    );
+    pending.catch(() => {});
+    await Bun.sleep(40);
+    const first = await client.turnProgress("turn-tool-rewrite", session, process.cwd());
+    expect(first?.lastTool).toBe("read");
+    message.content = [{ type: "tool", name: "bash" }];
+    await Bun.sleep(40);
+    const second = await client.turnProgress("turn-tool-rewrite", session, process.cwd());
+    expect(second?.lastTool).toBe("bash");
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
+test("a hung message lookup fails the turn instead of waiting before watch", async () => {
+  // Issue #3 の timeout 残件の再現形。watch 前の findMessage が応答しないと
+  // pending が未登録のため turn タイムアウトも効かず、executeTurn が戻らない。
+  const openCode = startFakeOpenCode({ messageDelayMs: 60_000 });
+  openCode.session("session-hung-message");
+  const client = new ManagedOpenCode(
+    openCode.url,
+    "opencode",
+    5_000,
+    10,
+    2_000,
+    2,
+    2,
+    1_000,
+    undefined,
+    50,
+  );
+  try {
+    const outcome = await Promise.race([
+      client
+        .executeTurn(
+          "session-hung-message",
+          process.cwd(),
+          "msg_66666666666666666666666666666666",
+          { message: "hung lookup" },
+          new AbortController().signal,
+        )
+        .then(
+          () => "resolved" as const,
+          (error: unknown) => error,
+        ),
+      Bun.sleep(1_000).then(() => "hung" as const),
+    ]);
+    expect(outcome).toMatchObject({ code: "OPENCODE_UNAVAILABLE", retryable: true });
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
 test("a server that rejects credentials reports OPENCODE_UNAUTHORIZED", async () => {
   await withoutEnvPassword(async () => {
     const openCode = startFakeOpenCode({ password: "pw-secret" });

@@ -122,6 +122,7 @@ class OpenCodeClient {
   constructor(
     private readonly baseUrl = "http://127.0.0.1:4096",
     private readonly auth: Auth = new Auth(),
+    private readonly requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {
     this.headers = { accept: "application/json" };
   }
@@ -313,7 +314,14 @@ class OpenCodeClient {
   ): Promise<Response> {
     let response: Response;
     try {
-      response = await fetch(url, { ...init, headers: { ...this.headersOf(), ...init.headers } });
+      // 呼び出し側の signal が無い REST 呼び出しはここで時間切れにする。応答しない
+      // serve へ watch 登録前に待ち続けると、pending 未登録で turn タイムアウトも
+      // 効かず executeTurn が戻らない。SSE とポーリングは呼び出し側の signal が優先。
+      response = await fetch(url, {
+        ...init,
+        signal: init.signal ?? AbortSignal.timeout(this.requestTimeoutMs),
+        headers: { ...this.headersOf(), ...init.headers },
+      });
     } catch (error) {
       if (init.signal?.aborted) {
         throw new OpenCodeFailure("TURN_INTERRUPTED", "The OpenCode turn was interrupted.", false);
@@ -359,6 +367,7 @@ class OpenCodeClient {
 
 const DEFAULT_TURN_TIMEOUT_MS = 5 * 60 * 1000;
 const TIMEOUT_CHECK_INTERVAL_MS = 30 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_REQUEST_TIMEOUT_MS = 2_000;
 const DEFAULT_POLL_DESCENDANT_LIMIT = 20;
 const DEFAULT_POLL_MESSAGE_LIMIT = 20;
@@ -402,13 +411,14 @@ export class ManagedOpenCode implements OpenCodePort {
     private readonly pollMessageLimit = DEFAULT_POLL_MESSAGE_LIMIT,
     private readonly activeSessionTtlMs = DEFAULT_ACTIVE_SESSION_TTL_MS,
     private readonly passwordFile?: string,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   ) {
     // 外部接続のときは環境変数のパスワード、自分で起動するときは固定パスワードを
     // 生成する。乱数パスワードは子プロセスに OPENCODE_PASSWORD として渡されるため
     // stdout を解析する必要がない。
     this.password = passwordFromEnvironment();
     this.auth = new Auth(this.password);
-    this.client = new OpenCodeClient(baseUrl, this.auth);
+    this.client = new OpenCodeClient(baseUrl, this.auth, requestTimeoutMs);
     this.timeoutTimer = setInterval(() => {
       void this.checkTimeouts();
     }, timeoutCheckIntervalMs);
