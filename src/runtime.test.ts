@@ -199,6 +199,46 @@ test("turn status does not mix another turn's progress", async () => {
   await runtime.interrupt(first.workerId);
 });
 
+test("turn status drops progress when the turn completes during the progress read", async () => {
+  // Issue #3 のレース残件の再現形。progressOf の再確認と snapshot 化の間に
+  // turn が完了すると、完了済み snapshot に実行中の progress が残った。
+  const directory = await mkdtemp(join(tmpdir(), "opencode-agent-progress-race-"));
+  temporaryDirectories.push(directory);
+  const client = new CompletingProgressClient();
+  const runtime = createWorkerRuntime({ client, stateFile: join(directory, "state.sqlite") });
+  runtimes.push(runtime);
+
+  const spawned = await runtime.spawn({ task: "finish during status", projectRoot: directory });
+  const snapshot = await runtime.status(spawned.turnId);
+  expect(snapshot).toMatchObject({ type: "turn", status: "completed", text: "done" });
+  if (snapshot.type === "turn") expect(snapshot.progress).toBeUndefined();
+});
+
+class CompletingProgressClient implements OpenCodePort {
+  private resolveTurn?: (text: string) => void;
+
+  async createSession(): Promise<string> {
+    return "session-progress-race";
+  }
+
+  executeTurn(): Promise<string> {
+    return new Promise((resolve) => {
+      this.resolveTurn = resolve;
+    });
+  }
+
+  // turnProgress の応答が返る直前に turn を完了させ、progressOf の再確認を
+  // 通り抜けた progress が snapshot に付く順序を作る。
+  async turnProgress(): Promise<TurnProgress | undefined> {
+    queueMicrotask(() => this.resolveTurn?.("done"));
+    return { steps: 1, activeSubagents: 0, lastActivityAt: Date.now() };
+  }
+
+  async abort(): Promise<void> {}
+
+  async close(): Promise<void> {}
+}
+
 class FakeOpenCode implements OpenCodePort {
   progress?: TurnProgress;
   private readonly progressByTurn = new Map<string, TurnProgress>();
