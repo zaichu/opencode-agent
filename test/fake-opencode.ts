@@ -330,6 +330,9 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
     await Bun.sleep(15);
     context.session.busy = true;
     context.addUser();
+    // interrupt されるまで busy を保つ終わらない turn。完了も idle マーカーも
+    // 出さないので、interrupt の検証が完了レースに左右されない。
+    if (context.prompt === "WAIT-FOR-INTERRUPT") return;
     const remembered = context.session.messages
       .map((message) => message.text ?? "")
       .join("\n")
