@@ -47,6 +47,7 @@ export interface FakeOpenCodeScenario {
   pollMessagesResponse?(session: FakeSession | undefined): unknown;
   pollMessagesStatus?(session: FakeSession | undefined): number | undefined;
   pollMessagesDelayMs?: number;
+  messageDelayMs?: number;
   childrenStatus?(sessionId: string): number | undefined;
   childrenDelayMs?: number;
 }
@@ -198,6 +199,7 @@ export function startFakeOpenCode(scenario: FakeOpenCodeScenario = {}): FakeOpen
       }
       const messageMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/message\/([^/]+)$/);
       if (request.method === "GET" && messageMatch) {
+        if (scenario.messageDelayMs) await Bun.sleep(scenario.messageDelayMs);
         const session = sessions.get(decodeURIComponent(messageMatch[1]!));
         const messageId = decodeURIComponent(messageMatch[2]!);
         const entry = session?.messages.find((message) => message.id === messageId);

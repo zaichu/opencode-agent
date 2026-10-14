@@ -246,7 +246,10 @@ export function createWorkerRuntime(input: {
       if (id.startsWith("trn_")) {
         const turnId = id as TurnId;
         const progress = await progressOf(turnId);
-        return turnSnapshot(requiredTurn(turnId), progress);
+        const turn = requiredTurn(turnId);
+        // progress を付けるかは snapshot 対象の status と同じ読み取りで決める。
+        // progressOf の再確認だけだと、それ以降に完了した turn へ進捗が残る。
+        return turnSnapshot(turn, turn.status === "running" ? progress : undefined);
       }
       throw new RuntimeError("INVALID_ID", `Expected a wrk_... or trn_... ID; received ${id}.`);
     },
