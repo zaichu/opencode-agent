@@ -212,6 +212,68 @@ test("an intermediate tool-call step does not replace the final assistant report
   }
 });
 
+test("a finished mid-turn step does not complete a follow-up turn before the idle marker", async () => {
+  // Issue #4 の再現形。途中 step の assistant メッセージが finish・completed 時刻を
+  // 持って確定してもループは続く。v1 はこの形を turn 終端と誤認し、実行中に
+  // 空 text の completed を返した。v2 は idle マーカーのみを完了とみなす。
+  let second: PromptContext | undefined;
+  const openCode = startFakeOpenCode({
+    onPrompt(context) {
+      context.session.busy = true;
+      context.addUser();
+      if (context.prompt === "first turn") {
+        const assistant = context.addAssistant({ text: "first done", completed: true, finish: "stop" });
+        context.complete(assistant);
+        return;
+      }
+      second = context;
+      context.addAssistant({ id: "assistant-mid-step", completed: true, finish: "stop" });
+      // step 境界でセッションが一時的に active 一覧から外れ、idle 相当の
+      // シグナルが届いても turn は解決しないこと。
+      context.session.busy = false;
+      context.emit("session.status", { sessionID: context.session.id, status: { type: "idle" } });
+      context.emit("session.execution.succeeded", { sessionID: context.session.id });
+      void (async () => {
+        await Bun.sleep(30);
+        const assistant = context.addAssistant({
+          id: "assistant-final",
+          text: "second real result",
+          completed: true,
+          finish: "stop",
+        });
+        context.complete(assistant);
+      })();
+    },
+  });
+  const client = new ManagedOpenCode(openCode.url, "opencode", 5_000, 10);
+  try {
+    const session = await client.createSession({ directory: process.cwd() });
+    await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11",
+      { message: "first turn" },
+      new AbortController().signal,
+      "turn-first",
+    );
+    // 途中で完了すれば "" か前turnの "first done" が返る。最終 step の text が
+    // 返ることで idle マーカーまで待ったことを確認する。
+    const result = await client.executeTurn(
+      session,
+      process.cwd(),
+      "msg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa22",
+      { message: "second turn" },
+      new AbortController().signal,
+      "turn-second",
+    );
+    expect(result).toBe("second real result");
+    expect(second).toBeDefined();
+  } finally {
+    await client.stop();
+    openCode.stop();
+  }
+});
+
 test("malformed OpenCode responses fail at the adapter seam", async () => {
   const openCode = startFakeOpenCode({ messagesResponse: () => ({ not: "an array" }) });
   openCode.session("session-malformed");
